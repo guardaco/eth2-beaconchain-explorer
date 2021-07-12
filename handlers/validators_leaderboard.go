@@ -3,16 +3,13 @@ package handlers
 import (
 	"encoding/json"
 	"eth2-exporter/db"
-	"eth2-exporter/services"
 	"eth2-exporter/types"
 	"eth2-exporter/utils"
-	"eth2-exporter/version"
 	"fmt"
 	"html/template"
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 )
 
 var validatorsLeaderboardTemplate = template.Must(template.New("validators").Funcs(utils.GetTemplateFuncs()).ParseFiles("templates/layout.html", "templates/validators_leaderboard.html"))
@@ -21,29 +18,8 @@ var validatorsLeaderboardTemplate = template.Must(template.New("validators").Fun
 func ValidatorsLeaderboard(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
 
-	data := &types.PageData{
-		HeaderAd: true,
-		Meta: &types.Meta{
-			Title:       fmt.Sprintf("%v - Validator Staking Leaderboard - beaconcha.in - %v", utils.Config.Frontend.SiteName, time.Now().Year()),
-			Description: "beaconcha.in makes the Ethereum 2.0. beacon chain accessible to non-technical end users",
-			Path:        "/validators/leaderboard",
-			GATag:       utils.Config.Frontend.GATag,
-		},
-		ShowSyncingMessage:    services.IsSyncing(),
-		Active:                "validators",
-		Data:                  nil,
-		User:                  getUser(w, r),
-		Version:               version.Version,
-		ChainSlotsPerEpoch:    utils.Config.Chain.SlotsPerEpoch,
-		ChainSecondsPerSlot:   utils.Config.Chain.SecondsPerSlot,
-		ChainGenesisTimestamp: utils.Config.Chain.GenesisTimestamp,
-		CurrentEpoch:          services.LatestEpoch(),
-		CurrentSlot:           services.LatestSlot(),
-		FinalizationDelay:     services.FinalizationDelay(),
-		EthPrice:              services.GetEthPrice(),
-		Mainnet:               utils.Config.Chain.Mainnet,
-		DepositContract:       utils.Config.Indexer.Eth1DepositContractAddress,
-	}
+	data := InitPageData(w, r, "validators", "/validators/leaderboard", "Validator Staking Leaderboard")
+	data.HeaderAd = true
 
 	err := validatorsLeaderboardTemplate.ExecuteTemplate(w, "layout", data)
 
@@ -56,6 +32,8 @@ func ValidatorsLeaderboard(w http.ResponseWriter, r *http.Request) {
 
 // ValidatorsLeaderboardData returns the leaderboard of validators according to their income in json
 func ValidatorsLeaderboardData(w http.ResponseWriter, r *http.Request) {
+	currency := GetCurrency(r)
+
 	w.Header().Set("Content-Type", "application/json")
 
 	q := r.URL.Query()
@@ -63,6 +41,21 @@ func ValidatorsLeaderboardData(w http.ResponseWriter, r *http.Request) {
 	search := strings.Replace(q.Get("search[value]"), "0x", "", -1)
 	if len(search) > 128 {
 		search = search[:128]
+	}
+	var searchIndex *uint64
+	index, err := strconv.ParseUint(search, 10, 64)
+	if err == nil {
+		searchIndex = &index
+	}
+
+	var searchPubkeyExact *string
+	var searchPubkeyLike *string
+	if searchPubkeyExactRE.MatchString(search) {
+		pubkey := strings.ToLower(strings.Replace(search, "0x", "", -1))
+		searchPubkeyExact = &pubkey
+	} else if searchPubkeyLikeRE.MatchString(search) {
+		pubkey := strings.ToLower(strings.Replace(search, "0x", "", -1))
+		searchPubkeyLike = &pubkey
 	}
 
 	draw, err := strconv.ParseUint(q.Get("draw"), 10, 64)
@@ -108,67 +101,68 @@ func ValidatorsLeaderboardData(w http.ResponseWriter, r *http.Request) {
 	var performanceData []*types.ValidatorPerformance
 
 	if search == "" {
-		err = db.DB.Get(&totalCount, `SELECT COUNT(*) FROM validator_performance`)
-		if err != nil {
-			logger.Errorf("error retrieving proposed blocks count: %v", err)
-			http.Error(w, "Internal server error", 503)
-			return
-		}
-
 		err = db.DB.Select(&performanceData, `
-			SELECT * FROM (
-				SELECT 
-					ROW_NUMBER() OVER (ORDER BY `+orderBy+` DESC) AS rank,
-					validator_performance.*,
-					validators.pubkey, 
-					COALESCE(validator_names.name, '') AS name
-				FROM validator_performance 
-					LEFT JOIN validators ON validators.validatorindex = validator_performance.validatorindex
-					LEFT JOIN validator_names ON validators.pubkey = validator_names.publickey
-				ORDER BY `+orderBy+` `+orderDir+`
+			SELECT 
+				a.*,
+				validators.pubkey,
+				COALESCE(validator_names.name, '') AS name,
+				cnt.total_count
+			FROM (
+					SELECT
+						ROW_NUMBER() OVER (ORDER BY `+orderBy+` DESC) AS rank,
+						validator_performance.*
+					FROM validator_performance
+					ORDER BY `+orderBy+` `+orderDir+`
+					LIMIT $1 OFFSET $2
 			) AS a
-			LIMIT $1 OFFSET $2`, length, start)
-		if err != nil {
-			logger.Errorf("error retrieving validator attestations data: %v", err)
-			http.Error(w, "Internal server error", 503)
-			return
-		}
+			LEFT JOIN validators ON validators.validatorindex = a.validatorindex
+			LEFT JOIN validator_names ON validators.pubkey = validator_names.publickey
+			LEFT JOIN (SELECT COUNT(*) FROM validator_performance) cnt(total_count) ON true`, length, start)
 	} else {
-		err = db.DB.Get(&totalCount, `
-			SELECT COUNT(*)
-			FROM validator_performance
-				LEFT JOIN validators ON validators.validatorindex = validator_performance.validatorindex
-				LEFT JOIN validator_names ON validators.pubkey = validator_names.publickey
-			WHERE (encode(validators.pubkey::bytea, 'hex') LIKE $1
-				OR CAST(validators.validatorindex AS text) LIKE $1)
-				OR LOWER(validator_names.name) LIKE LOWER($1)`, "%"+search+"%")
-		if err != nil {
-			logger.Errorf("error retrieving proposed blocks count with search: %v", err)
-			http.Error(w, "Internal server error", 503)
-			return
+		// for perfomance-reasons we combine multiple search results with `union`
+		args := []interface{}{}
+		args = append(args, "%"+strings.ToLower(search)+"%")
+		searchQry := fmt.Sprintf(`SELECT publickey AS pubkey FROM validator_names WHERE LOWER(name) LIKE $%d `, len(args))
+		if searchIndex != nil {
+			args = append(args, *searchIndex)
+			searchQry += fmt.Sprintf(`UNION SELECT pubkey FROM validators WHERE validatorindex = $%d `, len(args))
 		}
 
-		err = db.DB.Select(&performanceData, `
-			SELECT * FROM (
-				SELECT 
-					ROW_NUMBER() OVER (ORDER BY `+orderBy+` DESC) AS rank,
-					validator_performance.*,
-					validators.pubkey, 
-					COALESCE(validator_names.name, '') AS name
-				FROM validator_performance 
-					LEFT JOIN validators ON validators.validatorindex = validator_performance.validatorindex
-					LEFT JOIN validator_names ON validators.pubkey = validator_names.publickey
-				ORDER BY `+orderBy+` `+orderDir+`
-			) AS a
-			WHERE (encode(a.pubkey::bytea, 'hex') LIKE $3
-				OR CAST(a.validatorindex AS text) LIKE $3)
-				OR LOWER(a.name) LIKE LOWER($3)
-			LIMIT $1 OFFSET $2`, length, start, "%"+search+"%")
-		if err != nil {
-			logger.Errorf("error retrieving validator attestations data with search: %v", err)
-			http.Error(w, "Internal server error", 503)
-			return
+		if searchPubkeyExact != nil {
+			args = append(args, *searchPubkeyExact)
+			searchQry += fmt.Sprintf(`UNION SELECT pubkey FROM validators WHERE pubkeyhex = $%d `, len(args))
+		} else if searchPubkeyLike != nil {
+			args = append(args, *searchPubkeyLike+"%")
+			searchQry += fmt.Sprintf(`UNION SELECT pubkey FROM validators WHERE pubkeyhex LIKE $%d `, len(args))
 		}
+
+		args = append(args, length)
+		args = append(args, start)
+		qry := fmt.Sprintf(`
+			WITH matched_validators AS (%v)
+			SELECT 
+				v.validatorindex, mv.pubkey, COALESCE(vn.name, '') as name,
+				perf.rank, perf.balance, perf.performance1d, perf.performance7d, perf.performance31d, perf.performance365d, 
+				cnt.total_count
+			FROM matched_validators mv
+			INNER JOIN validators v ON v.pubkey = mv.pubkey
+			LEFT JOIN validator_names vn ON vn.publickey = mv.pubkey
+			LEFT JOIN (SELECT COUNT(*) FROM matched_validators) cnt(total_count) ON true
+			LEFT JOIN (
+				SELECT ROW_NUMBER() OVER (ORDER BY `+orderBy+` DESC) AS rank, validator_performance.*
+				FROM validator_performance
+				ORDER BY `+orderBy+` `+orderDir+`
+			) perf ON perf.validatorindex = v.validatorindex
+			LIMIT $%d OFFSET $%d`, searchQry, len(args)-1, len(args))
+		err = db.DB.Select(&performanceData, qry, args...)
+	}
+	if err != nil {
+		logger.Errorf("error retrieving performanceData data (search=%v): %v", search != "", err)
+		http.Error(w, "Internal server error", 503)
+		return
+	}
+	if len(performanceData) > 0 {
+		totalCount = performanceData[0].TotalCount
 	}
 
 	tableData := make([][]interface{}, len(performanceData))
@@ -178,10 +172,10 @@ func ValidatorsLeaderboardData(w http.ResponseWriter, r *http.Request) {
 			utils.FormatValidatorWithName(b.Index, b.Name),
 			utils.FormatPublicKey(b.PublicKey),
 			fmt.Sprintf("%v", b.Balance),
-			utils.FormatIncome(b.Performance1d),
-			utils.FormatIncome(b.Performance7d),
-			utils.FormatIncome(b.Performance31d),
-			utils.FormatIncome(b.Performance365d),
+			utils.FormatIncome(b.Performance1d, currency),
+			utils.FormatIncome(b.Performance7d, currency),
+			utils.FormatIncome(b.Performance31d, currency),
+			utils.FormatIncome(b.Performance365d, currency),
 		}
 	}
 
