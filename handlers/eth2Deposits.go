@@ -2,116 +2,57 @@ package handlers
 
 import (
 	"encoding/json"
-	"eth2-exporter/db"
-	"eth2-exporter/services"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
-	"eth2-exporter/version"
-	"fmt"
-	"html/template"
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
-)
 
-var eth2DepositsTemplate = template.Must(template.New("eth2Deposits").Funcs(utils.GetTemplateFuncs()).ParseFiles("templates/layout.html", "templates/eth2Deposits.html"))
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
+)
 
 // Eth2Deposits will return information about deposits using a go template
 func Eth2Deposits(w http.ResponseWriter, r *http.Request) {
-
-	w.Header().Set("Content-Type", "text/html")
-	data := &types.PageData{
-		HeaderAd: true,
-		Meta: &types.Meta{
-			Title:       fmt.Sprintf("%v - Eth1 Deposits - beaconcha.in - %v", utils.Config.Frontend.SiteName, time.Now().Year()),
-			Description: "beaconcha.in makes the Ethereum 2.0. beacon chain accessible to non-technical end users",
-			Path:        "/deposits/eth2",
-			GATag:       utils.Config.Frontend.GATag,
-		},
-		Active:                "eth2Deposits",
-		ShowSyncingMessage:    services.IsSyncing(),
-		Data:                  nil,
-		User:                  getUser(w, r),
-		Version:               version.Version,
-		ChainSlotsPerEpoch:    utils.Config.Chain.SlotsPerEpoch,
-		ChainSecondsPerSlot:   utils.Config.Chain.SecondsPerSlot,
-		ChainGenesisTimestamp: utils.Config.Chain.GenesisTimestamp,
-		CurrentEpoch:          services.LatestEpoch(),
-		CurrentSlot:           services.LatestSlot(),
-		FinalizationDelay:     services.FinalizationDelay(),
-		EthPrice:              services.GetEthPrice(),
-		Mainnet:               utils.Config.Chain.Mainnet,
-		DepositContract:       utils.Config.Indexer.Eth1DepositContractAddress,
-	}
-
-	err := eth2DepositsTemplate.ExecuteTemplate(w, "layout", data)
-
-	if err != nil {
-		logger.Errorf("error executing template for %v route: %v", r.URL.String(), err)
-		http.Error(w, "Internal server error", 503)
-		return
-	}
+	http.Redirect(w, r, "/validators/deposits", http.StatusMovedPermanently)
 }
 
 // Eth2DepositsData will return information eth1-deposits in json
 func Eth2DepositsData(w http.ResponseWriter, r *http.Request) {
+	currency := GetCurrency(r)
 	w.Header().Set("Content-Type", "application/json")
 
 	q := r.URL.Query()
 
-	search := q.Get("search[value]")
+	search := ReplaceEnsNameWithAddress(q.Get("search[value]"))
 	search = strings.Replace(search, "0x", "", -1)
 
 	draw, err := strconv.ParseUint(q.Get("draw"), 10, 64)
 	if err != nil {
-		logger.Errorf("error converting datatables data parameter from string to int: %v", err)
-		http.Error(w, "Internal server error", 503)
+		logger.Warnf("error converting datatables draw parameter from string to int: %v", err)
+		http.Error(w, "Error: Missing or invalid parameter draw", http.StatusBadRequest)
 		return
 	}
 	start, err := strconv.ParseUint(q.Get("start"), 10, 64)
 	if err != nil {
-		logger.Errorf("error converting datatables start parameter from string to int: %v", err)
-		http.Error(w, "Internal server error", 503)
+		logger.Warnf("error converting datatables start parameter from string to int: %v", err)
+		http.Error(w, "Error: Missing or invalid parameter start", http.StatusBadRequest)
 		return
 	}
 	length, err := strconv.ParseUint(q.Get("length"), 10, 64)
 	if err != nil {
-		logger.Errorf("error converting datatables length parameter from string to int: %v", err)
-		http.Error(w, "Internal server error", 503)
+		logger.Warnf("error converting datatables length parameter from string to int: %v", err)
+		http.Error(w, "Error: Missing or invalid parameter length", http.StatusBadRequest)
 		return
 	}
 	if length > 100 {
 		length = 100
 	}
-
-	orderColumn := q.Get("order[0][column]")
-	orderByMap := map[string]string{
-		"0": "block_slot",
-		// "1": "validatorindex",
-		"1": "publickey",
-		"2": "amount",
-		"3": "withdrawalcredentials",
-		"4": "signature",
-	}
-	orderBy, exists := orderByMap[orderColumn]
-	if !exists {
-		orderBy = "block_ts"
-	}
-
 	orderDir := q.Get("order[0][dir]")
 
-	depositCount, err := db.GetEth2DepositsCount()
+	deposits, depositCount, err := db.GetEth2Deposits(search, length, start, orderDir)
 	if err != nil {
-		logger.Errorf("error retrieving eth2_deposit count: %v", err)
-		http.Error(w, "Internal server error", 503)
-		return
-	}
-
-	deposits, err := db.GetEth2Deposits(search, length, start, orderBy, orderDir)
-	if err != nil {
-		logger.Errorf("error retrieving eth2_deposit data: %v", err)
-		http.Error(w, "Internal server error", 503)
+		logger.Errorf("error retrieving eth2_deposit data or count: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
@@ -120,9 +61,11 @@ func Eth2DepositsData(w http.ResponseWriter, r *http.Request) {
 		tableData[i] = []interface{}{
 			utils.FormatBlockSlot(d.BlockSlot),
 			utils.FormatPublicKey(d.Publickey),
-			utils.FormatDepositAmount(d.Amount),
-			utils.FormatHash(d.Withdrawalcredentials),
+			utils.FormatDepositAmount(d.Amount, currency),
+			utils.FormatWithdawalCredentials(d.Withdrawalcredentials, false),
 			utils.FormatHash(d.Signature),
+			utils.FormatHash(d.Withdrawalcredentials, false),
+			utils.FormatHash(d.Signature, false),
 		}
 	}
 
@@ -136,7 +79,7 @@ func Eth2DepositsData(w http.ResponseWriter, r *http.Request) {
 	err = json.NewEncoder(w).Encode(data)
 	if err != nil {
 		logger.Errorf("error enconding json response for %v route: %v", r.URL.String(), err)
-		http.Error(w, "Internal server error", 503)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 }

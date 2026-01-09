@@ -1,135 +1,157 @@
 package handlers
 
 import (
+	"database/sql"
 	"encoding/json"
-	"eth2-exporter/db"
-	"eth2-exporter/services"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
-	"eth2-exporter/version"
 	"fmt"
-	"html/template"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	"github.com/gobitfly/eth2-beaconchain-explorer/services"
+	"github.com/gobitfly/eth2-beaconchain-explorer/templates"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 
 	"github.com/gorilla/mux"
 )
 
-var epochTemplate = template.Must(template.New("epoch").Funcs(utils.GetTemplateFuncs()).ParseFiles("templates/layout.html", "templates/epoch.html"))
-var epochNotFoundTemplate = template.Must(template.New("epochnotfound").ParseFiles("templates/layout.html", "templates/epochnotfound.html"))
-
 // Epoch will show the epoch using a go template
 func Epoch(w http.ResponseWriter, r *http.Request) {
+	epochTemplateFiles := append(layoutTemplateFiles,
+		"epoch.html",
+		"components/timestamp.html")
+	epochFutureTemplateFiles := append(layoutTemplateFiles,
+		"epochFuture.html",
+		"components/timestamp.html")
+	epochNotFoundTemplateFiles := append(layoutTemplateFiles, "epochnotfound.html")
+	var epochTemplate = templates.GetTemplate(epochTemplateFiles...)
+	var epochFutureTemplate = templates.GetTemplate(epochFutureTemplateFiles...)
+	var epochNotFoundTemplate = templates.GetTemplate(epochNotFoundTemplateFiles...)
+
+	const MaxEpochValue = math.MaxUint32 + 1 // we only render a page for epochs up to this value
+
 	w.Header().Set("Content-Type", "text/html")
 	vars := mux.Vars(r)
 	epochString := strings.Replace(vars["epoch"], "0x", "", -1)
-
-	data := &types.PageData{
-		HeaderAd: true,
-		Meta: &types.Meta{
-			Description: "beaconcha.in makes the Ethereum 2.0. beacon chain accessible to non-technical end users",
-			GATag:       utils.Config.Frontend.GATag,
-		},
-		ShowSyncingMessage:    services.IsSyncing(),
-		Active:                "epochs",
-		Data:                  nil,
-		User:                  getUser(w, r),
-		Version:               version.Version,
-		ChainSlotsPerEpoch:    utils.Config.Chain.SlotsPerEpoch,
-		ChainSecondsPerSlot:   utils.Config.Chain.SecondsPerSlot,
-		ChainGenesisTimestamp: utils.Config.Chain.GenesisTimestamp,
-		CurrentEpoch:          services.LatestEpoch(),
-		CurrentSlot:           services.LatestSlot(),
-		FinalizationDelay:     services.FinalizationDelay(),
-		EthPrice:              services.GetEthPrice(),
-		Mainnet:               utils.Config.Chain.Mainnet,
-		DepositContract:       utils.Config.Indexer.Eth1DepositContractAddress,
-	}
+	epochTitle := fmt.Sprintf("Epoch %v", epochString)
 
 	epoch, err := strconv.ParseUint(epochString, 10, 64)
+	metaPath := fmt.Sprintf("/epoch/%v", epoch)
 
 	if err != nil {
-		data.Meta.Title = fmt.Sprintf("%v - Epoch %v - beaconcha.in - %v", utils.Config.Frontend.SiteName, epochString, time.Now().Year())
-		data.Meta.Path = "/epoch/" + epochString
-		logger.Errorf("error parsing epoch index %v: %v", epochString, err)
-		err = epochNotFoundTemplate.ExecuteTemplate(w, "layout", data)
+		data := InitPageData(w, r, "blockchain", metaPath, epochTitle, append(layoutTemplateFiles, epochNotFoundTemplateFiles...))
 
-		if err != nil {
-			logger.Errorf("error executing template for %v route: %v", r.URL.String(), err)
-			http.Error(w, "Internal server error", 503)
-			return
+		if handleTemplateError(w, r, "epoch.go", "Epoch", "parse epochString", epochNotFoundTemplate.ExecuteTemplate(w, "layout", data)) != nil {
+			return // an error has occurred and was processed
 		}
 		return
 	}
-
-	data.Meta.Title = fmt.Sprintf("%v - Epoch %v - beaconcha.in - %v", utils.Config.Frontend.SiteName, epoch, time.Now().Year())
-	data.Meta.Path = fmt.Sprintf("/epoch/%v", epoch)
 
 	epochPageData := types.EpochPageData{}
+	latestFinalizedEpoch := services.LatestFinalizedEpoch()
 
-	err = db.DB.Get(&epochPageData, `SELECT epoch, 
-											    blockscount, 
-											    proposerslashingscount, 
-											    attesterslashingscount, 
-											    attestationscount, 
-											    depositscount, 
-											    voluntaryexitscount, 
-											    validatorscount, 
-											    averagevalidatorbalance, 
-											    finalized,
-											    eligibleether,
-											    globalparticipationrate,
-											    votedether
-										FROM epochs 
-										WHERE epoch = $1`, epoch)
+	err = db.ReaderDb.Get(&epochPageData, `
+		SELECT 
+			epoch, 
+			blockscount, 
+			proposerslashingscount, 
+			attesterslashingscount, 
+			attestationscount, 
+			depositscount, 
+			voluntaryexitscount, 
+			validatorscount, 
+			averagevalidatorbalance, 
+			(epoch <= $2) AS finalized,
+			eligibleether,
+			globalparticipationrate,
+			votedether
+		FROM epochs 
+		WHERE epoch = $1`, epoch, latestFinalizedEpoch)
 	if err != nil {
-		//logger.Errorf("error getting epoch data: %v", err)
-		err = epochNotFoundTemplate.ExecuteTemplate(w, "layout", data)
-
-		if err != nil {
-			logger.Errorf("error executing template for %v route: %v", r.URL.String(), err)
-			http.Error(w, "Internal server error", 503)
+		//Epoch not in database -> Show future epoch
+		if epoch > MaxEpochValue {
+			data := InitPageData(w, r, "blockchain", metaPath, epochTitle, append(layoutTemplateFiles, epochNotFoundTemplateFiles...))
+			if handleTemplateError(w, r, "epoch.go", "Epoch", ">MaxEpochValue", epochNotFoundTemplate.ExecuteTemplate(w, "layout", data)) != nil {
+				return // an error has occurred and was processed
+			}
 			return
+		}
+
+		//Create placeholder structs
+		blocks := make([]*types.IndexPageDataBlocks, utils.Config.Chain.ClConfig.SlotsPerEpoch)
+		for i := range blocks {
+			slot := uint64(i) + (epoch * utils.Config.Chain.ClConfig.SlotsPerEpoch)
+			block := types.IndexPageDataBlocks{
+				Epoch:  epoch,
+				Slot:   slot,
+				Ts:     utils.SlotToTime(slot),
+				Status: 4,
+			}
+			n := int(utils.Config.Chain.ClConfig.SlotsPerEpoch) - 1 - i
+			blocks[n] = &block
+		}
+		epochPageData = types.EpochPageData{
+			Epoch:         epoch,
+			BlocksCount:   utils.Config.Chain.ClConfig.SlotsPerEpoch,
+			PreviousEpoch: epoch - 1,
+			NextEpoch:     epoch + 1,
+			Ts:            utils.EpochToTime(epoch),
+			Blocks:        blocks,
+		}
+
+		//Render template
+		data := InitPageData(w, r, "blockchain", metaPath, epochTitle, append(layoutTemplateFiles, epochFutureTemplateFiles...))
+		data.Data = epochPageData
+		if handleTemplateError(w, r, "epoch.go", "Epoch", "Done (not in Database)", epochFutureTemplate.ExecuteTemplate(w, "layout", data)) != nil {
+			return // an error has occurred and was processed
 		}
 		return
 	}
 
-	err = db.DB.Select(&epochPageData.Blocks, `SELECT blocks.slot, 
-											    blocks.proposer, 
-											    blocks.blockroot, 
-											    blocks.parentroot, 
-											    blocks.attestationscount, 
-											    blocks.depositscount, 
-											    blocks.voluntaryexitscount, 
-											    blocks.proposerslashingscount, 
-											    blocks.attesterslashingscount,
-       										blocks.status
-										FROM blocks 
-										WHERE epoch = $1
-										ORDER BY blocks.slot DESC`, epoch)
-
+	err = db.ReaderDb.Select(&epochPageData.Blocks, `
+		SELECT 
+			blocks.slot, 
+			blocks.proposer,
+			blocks.blockroot, 
+			blocks.parentroot, 
+			blocks.attestationscount, 
+			blocks.depositscount,
+			COALESCE(blocks.withdrawalcount,0) as withdrawalcount, 
+			blocks.voluntaryexitscount, 
+			blocks.proposerslashingscount, 
+			blocks.attesterslashingscount,
+       		blocks.status,
+			blocks.syncaggregate_participation,
+			COALESCE(validator_names.name, '') AS name
+		FROM blocks
+		LEFT JOIN validators ON blocks.proposer = validators.validatorindex
+		LEFT JOIN validator_names ON validators.pubkey = validator_names.publickey
+		WHERE epoch = $1
+		ORDER BY blocks.slot DESC`, epoch)
 	if err != nil {
 		logger.Errorf("error epoch blocks data: %v", err)
-		err = epochNotFoundTemplate.ExecuteTemplate(w, "layout", data)
+		data := InitPageData(w, r, "blockchain", metaPath, epochTitle, append(layoutTemplateFiles, epochNotFoundTemplateFiles...))
 
-		if err != nil {
-			logger.Errorf("error executing template for %v route: %v", r.URL.String(), err)
-			http.Error(w, "Internal server error", 503)
-			return
+		if handleTemplateError(w, r, "epoch.go", "Epoch", "read Blocks from db", epochNotFoundTemplate.ExecuteTemplate(w, "layout", data)) != nil {
+			return // an error has occurred and was processed
 		}
 		return
 	}
 
 	for _, block := range epochPageData.Blocks {
 		block.Ts = utils.SlotToTime(block.Slot)
+		block.ProposerFormatted = utils.FormatValidatorWithName(block.Proposer, block.ProposerName)
 
 		switch block.Status {
 		case 0:
 			epochPageData.ScheduledCount += 1
 		case 1:
 			epochPageData.ProposedCount += 1
+			epochPageData.SyncParticipationRate += block.SyncAggParticipation
+			epochPageData.WithdrawalCount += block.Withdrawals
 		case 2:
 			epochPageData.MissedCount += 1
 		case 3:
@@ -137,19 +159,38 @@ func Epoch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	withdrawalTotal, err := db.GetEpochWithdrawalsTotal(epoch)
+	if err != nil {
+		logger.Errorf("error getting epoch withdrawals total: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	epochPageData.WithdrawalTotal = utils.FormatCurrentBalance(withdrawalTotal, GetCurrency(r))
+
+	epochPageData.SyncParticipationRate /= float64(epochPageData.ProposedCount)
+
 	epochPageData.Ts = utils.EpochToTime(epochPageData.Epoch)
 
-	err = db.DB.Get(&epochPageData.NextEpoch, "SELECT epoch FROM epochs WHERE epoch > $1 ORDER BY epoch LIMIT 1", epochPageData.Epoch)
-	if err != nil {
-		logger.Errorf("error retrieving next epoch for epoch %v: %v", epochPageData.Epoch, err)
+	err = db.ReaderDb.Get(&epochPageData.NextEpoch, "SELECT epoch FROM epochs WHERE epoch > $1 ORDER BY epoch LIMIT 1", epochPageData.Epoch)
+	if err == sql.ErrNoRows {
 		epochPageData.NextEpoch = 0
-	}
-	err = db.DB.Get(&epochPageData.PreviousEpoch, "SELECT epoch FROM epochs WHERE epoch < $1 ORDER BY epoch DESC LIMIT 1", epochPageData.Epoch)
-	if err != nil {
-		logger.Errorf("error retrieving previous epoch for epoch %v: %v", epochPageData.Epoch, err)
-		epochPageData.PreviousEpoch = 0
+	} else if err != nil {
+		logger.Errorf("error retrieving next epoch for epoch %v: %v", epochPageData.Epoch, err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
 	}
 
+	if epochPageData.Epoch == 0 {
+		epochPageData.PreviousEpoch = 0
+	} else {
+		err = db.ReaderDb.Get(&epochPageData.PreviousEpoch, "SELECT epoch FROM epochs WHERE epoch < $1 ORDER BY epoch DESC LIMIT 1", epochPageData.Epoch)
+		if err != nil {
+			logger.Errorf("error retrieving previous epoch for epoch %v: %v", epochPageData.Epoch, err)
+			epochPageData.PreviousEpoch = 0
+		}
+	}
+
+	data := InitPageData(w, r, "blockchain", metaPath, epochTitle, append(layoutTemplateFiles, epochTemplateFiles...))
 	data.Data = epochPageData
 
 	if utils.IsApiRequest(r) {
@@ -159,9 +200,7 @@ func Epoch(w http.ResponseWriter, r *http.Request) {
 		err = epochTemplate.ExecuteTemplate(w, "layout", data)
 	}
 
-	if err != nil {
-		logger.Errorf("error executing template for %v route: %v", r.URL.String(), err)
-		http.Error(w, "Internal server error", 503)
-		return
+	if handleTemplateError(w, r, "epoch.go", "Epoch", "Done", err) != nil {
+		return // an error has occurred and was processed
 	}
 }

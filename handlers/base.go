@@ -2,9 +2,10 @@ package handlers
 
 import (
 	"encoding/json"
-	"eth2-exporter/utils"
 	"fmt"
 	"net/http"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 
 	"github.com/gorilla/context"
 )
@@ -49,9 +50,8 @@ func SetAutoContentType(w http.ResponseWriter, r *http.Request) {
 // ErrorOrJSONResponse http.Error for web OR json error for API
 func ErrorOrJSONResponse(w http.ResponseWriter, r *http.Request, errorText string, statusCode int) {
 	if IsMobileAuth(r) {
-		j := json.NewEncoder(w)
 		w.WriteHeader(statusCode)
-		SendErrorResponse(j, r.URL.String(), errorText)
+		SendBadRequestResponse(w, r.URL.String(), errorText)
 	} else {
 		http.Error(w, errorText, statusCode)
 	}
@@ -69,6 +69,9 @@ func FormValueOrJSON(r *http.Request, key string) string {
 		// we convert every param to string. Handling/casting to
 		// correct type is therefore escalated to handler
 		value := jsonBody.(map[string]interface{})[key]
+		if value == nil {
+			return ""
+		}
 		return fmt.Sprintf("%v", value)
 	}
 

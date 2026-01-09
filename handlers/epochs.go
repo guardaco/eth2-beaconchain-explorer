@@ -2,60 +2,36 @@ package handlers
 
 import (
 	"encoding/json"
-	"eth2-exporter/db"
-	"eth2-exporter/services"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
-	"eth2-exporter/version"
 	"fmt"
-	"html/template"
 	"net/http"
 	"strconv"
-	"time"
-)
 
-var epochsTemplate = template.Must(template.New("epochs").ParseFiles("templates/layout.html", "templates/epochs.html"))
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	"github.com/gobitfly/eth2-beaconchain-explorer/services"
+	"github.com/gobitfly/eth2-beaconchain-explorer/templates"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
+)
 
 // Epochs will return the epochs using a go template
 func Epochs(w http.ResponseWriter, r *http.Request) {
-	// epochsTemplate = template.Must(template.New("epochs").ParseFiles("templates/layout.html", "templates/epochs.html"))
+	templateFiles := append(layoutTemplateFiles,
+		"epochs.html",
+		"components/timestamp.html")
+	var epochsTemplate = templates.GetTemplate(templateFiles...)
+
 	w.Header().Set("Content-Type", "text/html")
 
-	data := &types.PageData{
-		HeaderAd: true,
-		Meta: &types.Meta{
-			Title:       fmt.Sprintf("%v - Epochs - beaconcha.in - %v", utils.Config.Frontend.SiteName, time.Now().Year()),
-			Description: "beaconcha.in makes the Ethereum 2.0. beacon chain accessible to non-technical end users",
-			Path:        "/epochs",
-			GATag:       utils.Config.Frontend.GATag,
-		},
-		ShowSyncingMessage:    services.IsSyncing(),
-		Active:                "epochs",
-		Data:                  nil,
-		User:                  getUser(w, r),
-		Version:               version.Version,
-		ChainSlotsPerEpoch:    utils.Config.Chain.SlotsPerEpoch,
-		ChainSecondsPerSlot:   utils.Config.Chain.SecondsPerSlot,
-		ChainGenesisTimestamp: utils.Config.Chain.GenesisTimestamp,
-		CurrentEpoch:          services.LatestEpoch(),
-		CurrentSlot:           services.LatestSlot(),
-		FinalizationDelay:     services.FinalizationDelay(),
-		EthPrice:              services.GetEthPrice(),
-		Mainnet:               utils.Config.Chain.Mainnet,
-		DepositContract:       utils.Config.Indexer.Eth1DepositContractAddress,
-	}
+	data := InitPageData(w, r, "blockchain", "/epochs", "Epochs", templateFiles)
 
-	err := epochsTemplate.ExecuteTemplate(w, "layout", data)
-
-	if err != nil {
-		logger.Errorf("error executing template for %v route: %v", r.URL.String(), err)
-		http.Error(w, "Internal server error", 503)
-		return
+	if handleTemplateError(w, r, "epochs.go", "Epochs", "Done", epochsTemplate.ExecuteTemplate(w, "layout", data)) != nil {
+		return // an error has occurred and was processed
 	}
 }
 
 // EpochsData will return the epoch data using a go template
 func EpochsData(w http.ResponseWriter, r *http.Request) {
+	currency := GetCurrency(r)
 	w.Header().Set("Content-Type", "application/json")
 
 	q := r.URL.Query()
@@ -67,20 +43,20 @@ func EpochsData(w http.ResponseWriter, r *http.Request) {
 
 	draw, err := strconv.ParseUint(q.Get("draw"), 10, 64)
 	if err != nil {
-		logger.Errorf("error converting datatables data parameter from string to int: %v", err)
-		http.Error(w, "Internal server error", 503)
+		logger.Warnf("error converting datatables draw parameter from string to int: %v", err)
+		http.Error(w, "Error: Missing or invalid parameter draw", http.StatusBadRequest)
 		return
 	}
 	start, err := strconv.ParseUint(q.Get("start"), 10, 64)
 	if err != nil {
-		logger.Errorf("error converting datatables start parameter from string to int: %v", err)
-		http.Error(w, "Internal server error", 503)
+		logger.Warnf("error converting datatables start parameter from string to int: %v", err)
+		http.Error(w, "Error: Missing or invalid parameter start", http.StatusBadRequest)
 		return
 	}
 	length, err := strconv.ParseUint(q.Get("length"), 10, 64)
 	if err != nil {
-		logger.Errorf("error converting datatables length parameter from string to int: %v", err)
-		http.Error(w, "Internal server error", 503)
+		logger.Warnf("error converting datatables length parameter from string to int: %v", err)
+		http.Error(w, "Error: Missing or invalid parameter length", http.StatusBadRequest)
 		return
 	}
 	if length > 100 {
@@ -101,26 +77,28 @@ func EpochsData(w http.ResponseWriter, r *http.Request) {
 
 	var epochs []*types.EpochsPageData
 
+	latestFinalizedEpoch := services.LatestFinalizedEpoch()
 	if search == -1 {
-		err = db.DB.Select(&epochs, `
+		err = db.ReaderDb.Select(&epochs, `
 			SELECT epoch, 
 				blockscount, 
 				proposerslashingscount, 
 				attesterslashingscount, 
 				attestationscount, 
 				depositscount, 
+				COALESCE(withdrawalcount,0) as withdrawalcount,
 				voluntaryexitscount, 
 				validatorscount, 
 				averagevalidatorbalance, 
-				finalized,
+				(epoch <= $3) AS finalized,
 				eligibleether,
 				globalparticipationrate,
 				votedether
 			FROM epochs 
 			WHERE epoch >= $1 AND epoch <= $2
-			ORDER BY epoch DESC`, endEpoch, startEpoch)
+			ORDER BY epoch DESC`, endEpoch, startEpoch, latestFinalizedEpoch)
 	} else {
-		err = db.DB.Select(&epochs, `
+		err = db.ReaderDb.Select(&epochs, `
 			SELECT epoch, 
 				blockscount, 
 				proposerslashingscount, 
@@ -130,45 +108,51 @@ func EpochsData(w http.ResponseWriter, r *http.Request) {
 				voluntaryexitscount, 
 				validatorscount, 
 				averagevalidatorbalance, 
-				finalized,
+				(epoch <= $2) AS finalized,
 				eligibleether,
 				globalparticipationrate,
 				votedether
 			FROM epochs 
 			WHERE epoch = $1
-			ORDER BY epoch DESC`, search)
+			ORDER BY epoch DESC`, search, latestFinalizedEpoch)
 	}
 	if err != nil {
 		logger.Errorf("error retrieving epoch data: %v", err)
-		http.Error(w, "Internal server error", 503)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
 	tableData := make([][]interface{}, len(epochs))
 	for i, b := range epochs {
+		// logger.Info("debug", b.Epoch, b.EligibleEther, b.VotedEther, b.GlobalParticipationRate, currency, utils.FormatBalance(b.EligibleEther, currency))
 		tableData[i] = []interface{}{
 			utils.FormatEpoch(b.Epoch),
 			utils.FormatTimestamp(utils.EpochToTime(b.Epoch).Unix()),
-			b.AttestationsCount,
-			b.DepositsCount,
-			fmt.Sprintf("%v / %v", b.ProposerSlashingsCount, b.AttesterSlashingsCount),
+			utils.FormatCount(b.AttestationsCount, b.Finalized, false),
+			fmt.Sprintf("%v / %v", utils.FormatCount(b.DepositsCount, b.Finalized, true), utils.FormatCount(b.WithdrawalCount, b.Finalized, true)),
+			fmt.Sprintf("%v / %v", utils.FormatCount(b.ProposerSlashingsCount, b.Finalized, true), utils.FormatCount(b.AttesterSlashingsCount, b.Finalized, true)),
 			utils.FormatYesNo(b.Finalized),
-			utils.FormatBalance(b.EligibleEther),
-			utils.FormatGlobalParticipationRate(b.VotedEther, b.GlobalParticipationRate),
+			utils.FormatBalance(b.EligibleEther, currency),
+			utils.FormatGlobalParticipationRate(b.VotedEther, b.GlobalParticipationRate, currency),
 		}
+	}
+
+	filteredCount := epochsCount
+	if search > -1 {
+		filteredCount = uint64(len(epochs))
 	}
 
 	data := &types.DataTableResponse{
 		Draw:            draw,
 		RecordsTotal:    epochsCount,
-		RecordsFiltered: epochsCount,
+		RecordsFiltered: filteredCount,
 		Data:            tableData,
 	}
 
 	err = json.NewEncoder(w).Encode(data)
 	if err != nil {
 		logger.Errorf("error enconding json response for %v route: %v", r.URL.String(), err)
-		http.Error(w, "Internal server error", 503)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 

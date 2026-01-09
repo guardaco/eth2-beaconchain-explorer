@@ -1,15 +1,17 @@
 package utils
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"io/ioutil"
+	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
 
-	"github.com/dgrijalva/jwt-go"
+	"github.com/golang-jwt/jwt"
 	"github.com/gorilla/context"
 	"github.com/sirupsen/logrus"
 )
@@ -30,6 +32,7 @@ const ClaimsContextKey = "ClaimsKey"
 const MobileAuthorizedKey = "MobileAuthKey"
 
 const JsonBodyKey = "JsonBodyKey"
+const JsonBodyNakedKey = "JsonBodyNakedKey"
 
 var logger = logrus.New().WithField("module", "oauth")
 var signingMethod = jwt.SigningMethodHS256
@@ -39,10 +42,12 @@ type CustomClaims struct {
 	UserID   uint64 `json:"userID"`
 	AppID    uint64 `json:"appID"`
 	DeviceID uint64 `json:"deviceID"`
+	Package  string `json:"package"`
+	Theme    string `json:"theme"`
 	jwt.StandardClaims
 }
 
-// OAuthResponse Structure of an successfull OAuth response
+// OAuthResponse Structure of an successful OAuth response
 type OAuthResponse struct {
 	AccessToken  string `json:"access_token"`
 	TokenType    string `json:"token_type"`
@@ -57,7 +62,7 @@ type OAuthErrorResponse struct {
 }
 
 // CreateAccessToken Creates a new access token for a given user
-func CreateAccessToken(userID, appID, deviceID uint64) (string, int, error) {
+func CreateAccessToken(userID, appID, deviceID uint64, pkg, theme string) (string, int, error) {
 	expiresIn := Config.Frontend.JwtValidityInMinutes * 60
 
 	standardlaims := jwt.StandardClaims{
@@ -69,6 +74,8 @@ func CreateAccessToken(userID, appID, deviceID uint64) (string, int, error) {
 		userID,
 		appID,
 		deviceID,
+		pkg,
+		theme,
 		standardlaims,
 	})
 
@@ -116,20 +123,33 @@ func accessTokenGetClaims(tokenStringFull string, validate bool) (*CustomClaims,
 	})
 
 	if err != nil && validate {
-		logger.Errorf("Error parsing jwt token: %v %v", err, token)
+		if !strings.Contains(err.Error(), "token is expired") && token != nil {
+			logger.WithFields(
+				logrus.Fields{
+					"error":       err,
+					"token":       token,
+					"tokenString": tokenString,
+				},
+			).Warn("Error parsing jwt token")
+		}
+
 		return nil, err
+	}
+
+	if token == nil {
+		return nil, fmt.Errorf("error token is not defined %v", tokenStringFull)
 	}
 
 	// Make sure header hasnt been tampered with
 	if token.Method != signingMethod {
-		return nil, errors.New("Only SHA256hmac as signature method is allowed")
+		return nil, errors.New("only SHA256hmac as signature method is allowed")
 	}
 
 	claims, ok := token.Claims.(*CustomClaims)
 
 	// Check issuer claim
 	if claims.Issuer != Config.Frontend.JwtIssuer {
-		return nil, errors.New("Invalid issuer claim")
+		return nil, errors.New("invalid issuer claim")
 	}
 
 	valid := ok && token.Valid
@@ -167,7 +187,6 @@ func SendOAuthResponse(j *json.Encoder, route, accessToken, refreshToken string,
 	if err != nil {
 		logger.Errorf("error serializing json error for API %v route: %v", route, err)
 	}
-	return
 }
 
 // SendOAuthErrorResponse creates and sends a OAuth error response according to RFC6749
@@ -181,7 +200,19 @@ func SendOAuthErrorResponse(j *json.Encoder, route, errString, description strin
 	if err != nil {
 		logger.Errorf("error serializing json error for API %v route: %v", route, err)
 	}
-	return
+}
+
+func GetAuthorizationClaims(r *http.Request) *CustomClaims {
+	accessToken := r.Header.Get("Authorization")
+	if len(accessToken) <= 0 {
+		return nil
+	}
+
+	claims, err := ValidateAccessTokenGetClaims(accessToken)
+	if err != nil {
+		return nil
+	}
+	return claims
 }
 
 // AuthorizedAPIMiddleware Demands an Authorization header to be present with a valid user api token
@@ -211,17 +242,18 @@ func AuthorizedAPIMiddleware(next http.Handler) http.Handler {
 		// as context to the request. By doing this here,
 		// we can use base.FormValueOrJson(key) without multiple parsings of the same body
 		if r.Method == "POST" && r.Header.Get("Content-Type") == "application/json" {
-			body, err := ioutil.ReadAll(r.Body)
+			body, err := io.ReadAll(r.Body)
 			if err == nil {
 				keyVal := make(map[string]interface{})
 				json.Unmarshal(body, &keyVal)
 				context.Set(r, JsonBodyKey, keyVal)
+				context.Set(r, JsonBodyNakedKey, body)
 			}
+			r.Body = io.NopCloser(bytes.NewReader(body))
 		}
 
 		context.Set(r, ClaimsContextKey, claims)
 		context.Set(r, MobileAuthorizedKey, true)
 		next.ServeHTTP(w, r)
-		return
 	})
 }

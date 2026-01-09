@@ -4,87 +4,230 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
-	"eth2-exporter/db"
-	"eth2-exporter/mail"
-	"eth2-exporter/utils"
 	"fmt"
 	"html/template"
 	"io"
-	"io/ioutil"
-	"log"
 	"net/http"
+	"time"
 
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	"github.com/gobitfly/eth2-beaconchain-explorer/mail"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
+
+	"github.com/sirupsen/logrus"
 	"github.com/stripe/stripe-go/v72"
 	portalsession "github.com/stripe/stripe-go/v72/billingportal/session"
 	"github.com/stripe/stripe-go/v72/checkout/session"
+	"github.com/stripe/stripe-go/v72/price"
+	"github.com/stripe/stripe-go/v72/promotioncode"
 	"github.com/stripe/stripe-go/v72/webhook"
 )
 
 // StripeCreateCheckoutSession creates a session to checkout api pricing subscription
 func StripeCreateCheckoutSession(w http.ResponseWriter, r *http.Request) {
-	user := getUser(w, r)
-
-	// check if a subscription exists
-	subscription, err := db.GetUserSubscription(user.UserID)
-	if err != nil {
-		logger.Errorf("error retrieving user subscriptions %v", err)
-		http.Error(w, "Internal server error", 503)
-		return
-	}
-
-	// don't let the user checkout another subscription
-	// changing subscription is not yet supported
-	if subscription.Active || subscription.SubscriptionID != nil {
-		logger.Errorf("error there is an active subscription cannot create another one %v", err)
-		w.WriteHeader(http.StatusBadRequest)
-		writeJSON(w, struct {
-			ErrorData string `json:"error"`
-		}{
-			ErrorData: "could not create a new stripe session",
-		})
-		return
-	}
+	user := getUser(r)
 
 	// get the product that the user wants to subscribe to
 	var req struct {
-		Price string `json:"priceId"`
+		Price         string `json:"priceId"`
+		AddonQuantity int64  `json:"addonQuantity"`
+		PromotionCode string `json:"promotionCode"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
-		log.Printf("json.NewDecoder.Decode: %v", err)
+		logger.Errorf("error decoding json.NewDecoder.Decode: %v", err)
 		return
 	}
+	rq := "required"
+
+	purchaseGroup := utils.GetPurchaseGroup(req.Price)
+
+	if purchaseGroup != utils.GROUP_ADDON {
+		req.AddonQuantity = 1
+	}
+
+	if purchaseGroup == "" {
+		http.Error(w, "Error invalid price item provided.", http.StatusBadRequest)
+		logger.Errorf("error invalid stripe price id provided: %v, expected one of [%v, %v, %v]", req.Price, utils.Config.Frontend.Stripe.Sapphire, utils.Config.Frontend.Stripe.Emerald, utils.Config.Frontend.Stripe.Diamond)
+		return
+	}
+
+	// check if a subscription exists
+	subscription, err := db.StripeGetUserSubscription(user.UserID, purchaseGroup)
+	if err != nil {
+		logger.Errorf("error retrieving user subscriptions %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	if purchaseGroup != utils.GROUP_ADDON {
+		// don't let the user checkout another subscription in the same group
+		if subscription.Active != nil && *subscription.Active {
+			logger.Errorf("error there is an active subscription cannot create another one %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			writeJSON(w, struct {
+				ErrorData string `json:"error"`
+			}{
+				ErrorData: "could not create a new stripe session",
+			})
+			return
+		}
+	} else {
+		addonSubs, err := db.StripeGetUserSubscriptions(user.UserID, utils.GROUP_ADDON)
+		if err != nil {
+			logger.Errorf("error retrieving user addon.subscriptions %v", err)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+		totalAddonValidators := int64(0)
+		for _, s := range addonSubs {
+			p := utils.EffectiveProductId(utils.PriceIdToProductId(*s.PriceID))
+			switch p {
+			case "vdb_addon_1k", "vdb_addon_1k.yearly":
+				totalAddonValidators += 1_000
+			case "vdb_addon_10k", "vdb_addon_10k.yearly":
+				totalAddonValidators += 10_000
+			default:
+				logger.Warnf("unknown existing addon-product: %v", p)
+			}
+		}
+		p := utils.EffectiveProductId(utils.PriceIdToProductId(req.Price))
+		switch p {
+		case "vdb_addon_1k", "vdb_addon_1k.yearly":
+			totalAddonValidators += (1_000 * req.AddonQuantity)
+		case "vdb_addon_10k", "vdb_addon_10k.yearly":
+			totalAddonValidators += (10_000 * req.AddonQuantity)
+		default:
+			logger.Warnf("unknown new addon-product: %v", p)
+		}
+		if totalAddonValidators > 100_000 {
+			logger.Errorf("error addon can not be purchased since limit has been reached: %v", totalAddonValidators)
+			w.WriteHeader(http.StatusBadRequest)
+			writeJSON(w, struct {
+				ErrorData string `json:"error"`
+			}{
+				ErrorData: "could not create a new stripe session since dasboard-validators-limit has been reached",
+			})
+		}
+	}
+
+	// taxRates := utils.StripeDynamicRatesLive
+	// if strings.HasPrefix(utils.Config.Frontend.Stripe.SecretKey, "sk_test") {
+	// 	taxRates = utils.StripeDynamicRatesTest
+	// }
+
+	enabled := true
+	auto := "auto"
+
+	var successUrl = stripe.String("https://" + utils.Config.Frontend.SiteDomain + "/pricing")
+	var cancelUrl = stripe.String("https://" + utils.Config.Frontend.SiteDomain + "/pricing")
+	if purchaseGroup == utils.GROUP_MOBILE || purchaseGroup == utils.GROUP_ADDON {
+		successUrl = stripe.String("https://" + utils.Config.Frontend.SiteDomain + "/premium")
+		cancelUrl = stripe.String("https://" + utils.Config.Frontend.SiteDomain + "/premium")
+	}
+
 	params := &stripe.CheckoutSessionParams{
-		SuccessURL: stripe.String(utils.Config.Frontend.SiteDomain + "/user/settings"),
-		CancelURL:  stripe.String(utils.Config.Frontend.SiteDomain + "/pricing"),
+		SuccessURL: successUrl,
+		CancelURL:  cancelUrl,
 		// if the customer exists use the existing customer
-		SubscriptionData: &stripe.CheckoutSessionSubscriptionDataParams{
-			// DefaultTaxRates: stripe.StringSlice([]string{
-			// "txr_1HqcFcBiORp9oTlKnyNWVp4r",
-			// "txr_1HqdWaBiORp9oTlKkij8L6dU",
-			// }),
-		},
-		CustomerEmail: &subscription.Email,
+		SubscriptionData:         &stripe.CheckoutSessionSubscriptionDataParams{},
+		BillingAddressCollection: &rq,
+		CustomerEmail:            &subscription.Email,
 		PaymentMethodTypes: stripe.StringSlice([]string{
 			"card",
 		}),
-		Mode: stripe.String(string(stripe.CheckoutSessionModeSubscription)),
+		AllowPromotionCodes: &enabled,
+		Mode:                stripe.String(string(stripe.CheckoutSessionModeSubscription)),
 		LineItems: []*stripe.CheckoutSessionLineItemParams{
-			&stripe.CheckoutSessionLineItemParams{
+			{
 				Price:    stripe.String(req.Price),
-				Quantity: stripe.Int64(1),
+				Quantity: stripe.Int64(req.AddonQuantity),
+				// DynamicTaxRates: taxRates,
 			},
 		},
+		AutomaticTax: &stripe.CheckoutSessionAutomaticTaxParams{
+			Enabled: &enabled,
+		},
+		TaxIDCollection: &stripe.CheckoutSessionTaxIDCollectionParams{
+			Enabled: &enabled,
+		},
 	}
-
 	if subscription.CustomerID != nil {
 		params.CustomerEmail = nil
 		params.Customer = subscription.CustomerID
+		params.CustomerUpdate = &stripe.CheckoutSessionCustomerUpdateParams{
+			Name:    &auto,
+			Address: &auto,
+		}
+	}
+
+	if req.PromotionCode != "" {
+		stripePrice, err := price.Get(req.Price, nil)
+		if err != nil || stripePrice == nil || stripePrice.Product == nil {
+			logger.WithError(err).WithField("stripePrice", stripePrice).Error("error retrieving stripe product for promotion code")
+			w.WriteHeader(http.StatusInternalServerError)
+			writeJSON(w, struct {
+				ErrorData string `json:"error"`
+			}{
+				ErrorData: "could not create a new stripe session, please try again later",
+			})
+			return
+		}
+
+		pcListParams := &stripe.PromotionCodeListParams{
+			Code:   stripe.String(req.PromotionCode),
+			Active: stripe.Bool(true),
+		}
+		pcListParams.AddExpand("data.coupon.applies_to")
+		it := promotioncode.List(pcListParams)
+		if it.Err() != nil {
+			logger.WithError(it.Err()).Error("error retrieving stripe promotion code")
+			w.WriteHeader(http.StatusInternalServerError)
+			writeJSON(w, struct {
+				ErrorData string `json:"error"`
+			}{
+				ErrorData: "could not create a new stripe session, please try again later",
+			})
+			return
+		}
+
+		var pc *stripe.PromotionCode
+
+		for it.Next() {
+			currPc := it.PromotionCode()
+			if currPc == nil {
+				continue
+			}
+			// use the latest promotion code
+			if pc != nil && currPc.Created < pc.Created {
+				continue
+			}
+			if currPc.Coupon == nil || currPc.Coupon.AppliesTo == nil {
+				continue
+			}
+			for _, p := range currPc.Coupon.AppliesTo.Products {
+				if stripePrice.Product.ID == p {
+					pc = currPc
+					break
+				}
+			}
+		}
+
+		// if promotion code is not found just ignore it
+		if pc != nil {
+			params.AllowPromotionCodes = nil
+			params.Discounts = []*stripe.CheckoutSessionDiscountParams{
+				{
+					PromotionCode: stripe.String(pc.ID),
+				},
+			}
+		}
 	}
 
 	s, err := session.New(params)
 	if err != nil {
-		logger.WithError(err).Error("failed to create a new stripe checkout session")
+		logger.WithError(err).Warn("failed to create a new stripe checkout session")
 		w.WriteHeader(http.StatusBadRequest)
 		writeJSON(w, struct {
 			ErrorData string `json:"error"`
@@ -103,7 +246,7 @@ func StripeCreateCheckoutSession(w http.ResponseWriter, r *http.Request) {
 
 // StripeCustomerPortal redirects the user to the customer portal
 func StripeCustomerPortal(w http.ResponseWriter, r *http.Request) {
-	user := getUser(w, r)
+	user := getUser(r)
 
 	var req struct {
 		ReturnURL string `json:"returnURL"`
@@ -115,9 +258,9 @@ func StripeCustomerPortal(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var customerID string
-	err := db.FrontendDB.Get(&customerID, `
+	err := db.FrontendWriterDB.Get(&customerID, `
 	SELECT
-		stripe_customerID
+		stripe_customer_id
 	FROM
 		users
 	WHERE
@@ -150,7 +293,7 @@ func StripeWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
 		return
 	}
-	b, err := ioutil.ReadAll(r.Body)
+	b, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		logger.WithError(err).Error("error failed to read body for StripeWebhook")
@@ -164,25 +307,26 @@ func StripeWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	logger.WithFields(logrus.Fields{"type": event.Type}).Infof("received stripe webhook")
+
 	switch event.Type {
 	case "customer.created":
 		var customer stripe.Customer
 		err := json.Unmarshal(event.Data.Raw, &customer)
 		if err != nil {
 			logger.WithError(err).Error("error parsing stripe webhook JSON")
-			http.Error(w, "Internal server error", 503)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
-		if customer.Email != "" {
-			err = db.UpdateStripeCustomer(customer.Email, customer.ID)
-			if err != nil {
-				logger.WithError(err).Error("error could not update user with a stripe customerID")
-				http.Error(w, "Internal server error", 503)
-				return
-			}
-		} else {
-			logger.Error("error no email provided when creating stripe customer")
-			http.Error(w, "Internal server error", 503)
+		if customer.Email == "" {
+			utils.LogError(nil, fmt.Errorf("error no email provided when creating stripe customer %v", customer.ID), 0)
+			http.Error(w, "error no email provided when creating stripe customer "+customer.ID, http.StatusBadRequest)
+			return
+		}
+		err = db.StripeUpdateCustomerID(customer.Email, customer.ID)
+		if err != nil {
+			logger.WithError(err).Error("error could not update user with a stripe customerID ", customer.ID)
+			http.Error(w, "error could not update user with a stripe customerID "+customer.ID+" err: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 
@@ -190,15 +334,21 @@ func StripeWebhook(w http.ResponseWriter, r *http.Request) {
 		var customer stripe.Customer
 		err := json.Unmarshal(event.Data.Raw, &customer)
 		if err != nil {
-			logger.WithError(err).Error("error parsing stripe webhook JSON")
-			http.Error(w, "Internal server error", 503)
+			logger.WithError(err).Error("error parsing stripe webhook JSON", err)
+			http.Error(w, "error parsing stripe webhook JSON", http.StatusInternalServerError)
 			return
 		}
 
-		err = db.UpdateRemoveStripeCustomer(customer.ID)
+		err = db.DisableAllSubscriptionsFromStripeUser(customer.ID)
 		if err != nil {
-			logger.WithError(err).Error("error could not update user with a stripe customerID")
-			http.Error(w, "Internal server error", 503)
+			logger.WithError(err).Error("error could not disable stripe mobile subs: " + customer.ID + "err: ")
+			// log & continue anyway
+		}
+
+		err = db.StripeRemoveCustomer(customer.ID)
+		if err != nil {
+			logger.WithError(err).Error("error could not delete user with customer ID: " + customer.ID + "err: ")
+			http.Error(w, "error could not delete user with customer ID: "+customer.ID+"err: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 
@@ -210,49 +360,40 @@ func StripeWebhook(w http.ResponseWriter, r *http.Request) {
 		err := json.Unmarshal(event.Data.Raw, &session)
 		if err != nil {
 			logger.WithError(err).Error("error parsing stripe webhook JSON")
-			http.Error(w, "Internal server error", 503)
+			http.Error(w, "error parsing stripe webhook JSON", http.StatusInternalServerError)
 			return
 		}
-
-		// if session.Customer.Email != "" {
-		// 	err = db.UpdateStripeCustomer(session.Customer.Email, session.Customer.ID)
-		// 	if err != nil {
-		// 		logger.WithError(err).Error("error could not update user with a stripe customerID")
-		// 		http.Error(w, "Internal server error", 503)
-		// 		return
-		// 	}
-		// } else {
-		// 	logger.Error("the session object does not have a customer email", session, session.Customer)
-		// 	http.Error(w, "Internal server error", 503)
-		// 	return
-		// }
 
 	case "customer.subscription.created":
 		var subscription stripe.Subscription
 		err := json.Unmarshal(event.Data.Raw, &subscription)
 		if err != nil {
 			logger.WithError(err).Error("error parsing stripe webhook JSON")
-			http.Error(w, "Internal server error", 503)
+			http.Error(w, "error parsing stripe webhook JSON", http.StatusInternalServerError)
 			return
 		}
 
 		if subscription.Items == nil {
 			logger.WithError(err).Error("error creating subscription no items found", subscription)
-			http.Error(w, "Internal server error", 503)
+			http.Error(w, "error creating subscription no items found", http.StatusBadRequest)
 			return
 		}
 
 		if len(subscription.Items.Data) == 0 {
 			logger.WithError(err).Error("error creating subscription no items found", subscription)
-			http.Error(w, "Internal server error", 503)
+			http.Error(w, "error creating subscription no items found", http.StatusBadRequest)
 			return
 		}
 
-		err = db.UpdateAddSubscription(subscription.Customer.ID, subscription.Items.Data[0].Price.ID, subscription.ID)
-		if err != nil {
-			logger.WithError(err).Error("error updating user with subscription", event.Data.Object)
-			http.Error(w, "Internal server error", 503)
-			return
+		// to handle race condition errors where subscription.updated is executed before customer.subscription.created, do nothing since it's already processed
+		_, err = db.StripeGetSubscription(subscription.ID)
+		if err == sql.ErrNoRows {
+			err = createNewStripeSubscription(subscription, event)
+			if err != nil {
+				logger.WithError(err).Error(err.Error(), event.Data.Object)
+				http.Error(w, "error "+err.Error()+" customer: "+subscription.Customer.ID, http.StatusInternalServerError)
+				return
+			}
 		}
 
 	case "customer.subscription.updated":
@@ -260,40 +401,68 @@ func StripeWebhook(w http.ResponseWriter, r *http.Request) {
 		err := json.Unmarshal(event.Data.Raw, &subscription)
 		if err != nil {
 			logger.WithError(err).Error("error parsing stripe webhook JSON")
-			http.Error(w, "Internal server error", 503)
+			http.Error(w, "error parsing stripe webhook JSON", http.StatusInternalServerError)
 			return
 		}
 
 		if subscription.Items == nil {
-			logger.WithError(err).Error("error creating subscription no items found", subscription)
-			http.Error(w, "Internal server error", 503)
+			utils.LogError(nil, fmt.Errorf("error updating subscription no items found %v", subscription), 0)
+			http.Error(w, "error updating subscription no items found", http.StatusBadRequest)
 			return
 		}
 
 		if len(subscription.Items.Data) == 0 {
-			logger.WithError(err).Error("error creating subscription no items found", subscription)
-			http.Error(w, "Internal server error", 503)
+			utils.LogError(nil, fmt.Errorf("error updating subscription no data found %v", subscription), 0)
+			http.Error(w, "error updating subscription no items found", http.StatusBadRequest)
 			return
 		}
-
 		priceID := subscription.Items.Data[0].Price.ID
 
-		currPriceID, err := db.GetUserPriceID(subscription.Customer.ID)
-		if err != nil && err != sql.ErrNoRows {
-			logger.WithError(err).Error("error retrieving customers priceID ", subscription.Customer.ID)
-			http.Error(w, "Internal server error", 503)
-			return
-		}
+		currSub, err := db.StripeGetSubscription(subscription.ID)
 
-		err = db.UpdateAddSubscription(subscription.Customer.ID, priceID, subscription.ID)
 		if err != nil {
-			logger.WithError(err).Error("error updating user with subscription", event.Data.Object)
-			http.Error(w, "Internal server error", 503)
+			logger.WithError(err).Error("error getting subscription from database with id ", subscription.ID)
+			http.Error(w, "error updating subscription could not get current subscription err:"+err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		if currPriceID != nil && *currPriceID != priceID {
-			EmailCustomerAboutPlanChange(subscription.Customer.Email)
+		tx, err := db.FrontendWriterDB.Begin()
+		if err != nil {
+			logger.WithError(err).Error("error creating transaction ", subscription.ID)
+			http.Error(w, "error creating transaction :"+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer tx.Rollback()
+
+		err = db.StripeUpdateSubscription(tx, priceID, subscription.ID, event.Data.Raw)
+		if err != nil {
+			logger.WithError(err).Error("error updating user subscription", subscription.ID)
+			http.Error(w, "error updating user subscription, customer: "+subscription.Customer.ID, http.StatusInternalServerError)
+			return
+		}
+
+		if utils.GetPurchaseGroup(priceID) == utils.GROUP_MOBILE || utils.GetPurchaseGroup(priceID) == utils.GROUP_ADDON {
+			err := db.ChangeProductIDFromStripe(tx, subscription.ID, utils.PriceIdToProductId(priceID))
+			if err != nil {
+				logger.WithError(err).Error("error updating stripe mobile subscription", subscription.ID)
+				http.Error(w, "error updating stripe mobile subscription customer: "+subscription.Customer.ID, http.StatusInternalServerError)
+				return
+			}
+		}
+
+		err = tx.Commit()
+		if err != nil {
+			logger.WithError(err).Error("error committing transaction ", subscription.ID)
+			http.Error(w, "error committing transaction :"+err.Error(), http.StatusInternalServerError)
+		}
+
+		if currSub.PriceID != nil && *currSub.PriceID != priceID && utils.GetPurchaseGroup(*currSub.PriceID) == utils.GetPurchaseGroup(priceID) {
+			email, err := db.StripeGetCustomerEmail(subscription.Customer.ID)
+			if err != nil {
+				logger.WithError(err).Error("error retrieving customer email for subscription ", subscription.ID)
+				http.Error(w, "error retrieving customer email for subscription err:"+err.Error(), http.StatusInternalServerError)
+			}
+			emailCustomerAboutPlanChange(email, priceID)
 		}
 
 	case "customer.subscription.deleted":
@@ -302,14 +471,46 @@ func StripeWebhook(w http.ResponseWriter, r *http.Request) {
 		err := json.Unmarshal(event.Data.Raw, &subscription)
 		if err != nil {
 			logger.WithError(err).Error("error parsing stripe webhook JSON")
-			http.Error(w, "Internal server error", 503)
+			http.Error(w, "error parsing stripe webhook JSON", http.StatusInternalServerError)
 			return
 		}
 
-		err = db.UpdateRemoveSubscription(subscription.Customer.ID)
+		tx, err := db.FrontendWriterDB.Begin()
 		if err != nil {
-			logger.WithError(err).Error("error updating user to remove subscription", event.Data.Object)
-			http.Error(w, "Internal server error", 503)
+			logger.WithError(err).Error("error creating transaction ", subscription.ID)
+			http.Error(w, "error creating transaction :"+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer tx.Rollback()
+
+		err = db.StripeUpdateSubscriptionStatus(tx, subscription.ID, false, &event.Data.Raw)
+		if err != nil {
+			logger.WithError(err).Error("error while deactivating subscription", event.Data.Object)
+			http.Error(w, "error while deactivating subscription, customer:"+subscription.Customer.ID, http.StatusInternalServerError)
+			return
+		}
+
+		if utils.GetPurchaseGroup(subscription.Items.Data[0].Price.ID) == utils.GROUP_MOBILE || utils.GetPurchaseGroup(subscription.Items.Data[0].Price.ID) == utils.GROUP_ADDON {
+			appSubID, err := db.GetUserSubscriptionIDByStripe(subscription.ID)
+			if err != nil {
+				logger.WithError(err).Error("error updating stripe mobile subscription, no users_app_subs id found for subscription id", subscription.ID)
+				http.Error(w, "error updating stripe mobile subscription, no users_app_subs id  found for subscription id, customer: "+subscription.Customer.ID, http.StatusInternalServerError)
+				return
+			}
+			now := time.Now()
+			nowTs := now.Unix()
+			err = db.UpdateUserSubscription(tx, appSubID, false, nowTs, "user_canceled")
+			if err != nil {
+				logger.WithError(err).Error("error updating stripe mobile subscription (sub deleted)", subscription.ID)
+				http.Error(w, "error updating stripe mobile subscription customer: "+subscription.Customer.ID, http.StatusInternalServerError)
+				return
+			}
+		}
+
+		err = tx.Commit()
+		if err != nil {
+			logger.WithError(err).Error("error committing transaction ", subscription.ID)
+			http.Error(w, "error committing transaction :"+err.Error(), http.StatusInternalServerError)
 			return
 		}
 
@@ -322,13 +523,79 @@ func StripeWebhook(w http.ResponseWriter, r *http.Request) {
 		err := json.Unmarshal(event.Data.Raw, &invoice)
 		if err != nil {
 			logger.WithError(err).Error("error parsing stripe webhook JSON")
-			http.Error(w, "Internal server error", 503)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
-		err = db.UpdateActivateSubsciption(invoice.Customer.ID)
+
+		if invoice.Lines == nil {
+			logger.Warn("warning processing invoice and updating subscription no items found", invoice.ID)
+			return
+		}
+
+		if len(invoice.Lines.Data) == 0 {
+			logger.Warn("warning processing invoice and updating subscription no items found", invoice.ID)
+			return
+		}
+
+		if len(invoice.Lines.Data[0].Subscription) == 0 {
+			logger.Warn("error processing invoice and updating subscription no items found", invoice.ID)
+			return
+		}
+
+		var tx *sql.Tx
+
+		// retry updating subs if webhooks come out of order (customer.subscription.created coming after invoice.paid)
+		retries := 0
+		for {
+			tx, err = db.FrontendWriterDB.Begin()
+			if err != nil {
+				logger.WithError(err).Error("error creating transaction ")
+				http.Error(w, "error creating transaction :"+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			defer tx.Rollback()
+			err = db.StripeUpdateSubscriptionStatus(tx, invoice.Lines.Data[0].Subscription, true, nil)
+			if err == nil {
+				break
+			}
+			if err == sql.ErrNoRows || err.Error() == "no rows affected" {
+				retries++
+				if retries > 5 {
+					break
+				}
+				tx.Rollback()
+				time.Sleep(1000 * time.Millisecond)
+				logger.Warnf("retrying processing of invoice.paid for sub %v", invoice.Lines.Data[0].Subscription)
+				continue
+			}
+			break
+		}
+
 		if err != nil {
-			logger.WithError(err).Error("error failed to activate subscription for customer", invoice.Customer.ID)
-			http.Error(w, "Internal server error", 503)
+			logger.WithError(err).Error("error processing invoice failed to activate subscription for customer", invoice.Customer.ID)
+			http.Error(w, "error processing invoice failed to activate subscription for customer", http.StatusInternalServerError)
+			return
+		}
+
+		if utils.GetPurchaseGroup(invoice.Lines.Data[0].Price.ID) == utils.GROUP_MOBILE || utils.GetPurchaseGroup(invoice.Lines.Data[0].Price.ID) == utils.GROUP_ADDON {
+			appSubID, err := db.GetUserSubscriptionIDByStripe(invoice.Lines.Data[0].Subscription)
+			if err != nil {
+				logger.WithError(err).Error("error updating stripe mobile subscription (paid), no users_app_subs id found for subscription id", invoice.Lines.Data[0].Subscription)
+				http.Error(w, "error updating stripe mobile subscription, no users_app_subs id  found for subscription id, customer: "+invoice.Customer.ID, http.StatusInternalServerError)
+				return
+			}
+			err = db.UpdateUserSubscription(tx, appSubID, true, 0, "")
+			if err != nil {
+				logger.WithError(err).Error("error updating stripe mobile subscription (paid)", invoice.Lines.Data[0].Subscription)
+				http.Error(w, "error updating stripe mobile subscription customer: "+invoice.Customer.ID, http.StatusInternalServerError)
+				return
+			}
+		}
+
+		err = tx.Commit()
+		if err != nil {
+			logger.WithError(err).Error("error committing transaction ")
+			http.Error(w, "error committing transaction :"+err.Error(), http.StatusInternalServerError)
 			return
 		}
 
@@ -340,32 +607,119 @@ func StripeWebhook(w http.ResponseWriter, r *http.Request) {
 		err := json.Unmarshal(event.Data.Raw, &invoice)
 		if err != nil {
 			logger.WithError(err).Error("error parsing stripe webhook JSON")
-			http.Error(w, "Internal server error", 503)
+			http.Error(w, "error parsing stripe webhook JSON", http.StatusInternalServerError)
 			return
 		}
-		EmailCustomerAboutFailedPayment(invoice.CustomerEmail)
+		emailCustomerAboutFailedPayment(invoice.CustomerEmail)
 	default:
 		return
 		// unhandled event type
 	}
 }
 
-func EmailCustomerAboutFailedPayment(email string) {
-	msg := fmt.Sprintf("Payment processing failed. Could not provision your API key. Please contact support at support@beaconcha.in.")
+func createNewStripeSubscription(subscription stripe.Subscription, event stripe.Event) error {
+	tx, err := db.FrontendWriterDB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	err = db.StripeCreateSubscription(tx, subscription.Customer.ID, subscription.Items.Data[0].Price.ID, subscription.ID, event.Data.Raw)
+	if err != nil {
+		return err
+	}
+
+	if utils.GetPurchaseGroup(subscription.Items.Data[0].Price.ID) == utils.GROUP_MOBILE || utils.GetPurchaseGroup(subscription.Items.Data[0].Price.ID) == utils.GROUP_ADDON {
+		userID, err := db.StripeGetCustomerUserId(subscription.Customer.ID)
+		if err != nil {
+			return err
+		}
+		details := types.MobileSubscription{
+			ProductID:   utils.PriceIdToProductId(subscription.Items.Data[0].Price.ID),
+			PriceMicros: uint64(subscription.Items.Data[0].Price.UnitAmount),
+			Currency:    string(subscription.Items.Data[0].Price.Currency),
+			Transaction: types.MobileSubscriptionTransactionGeneric{
+				Type:    "stripe",
+				Receipt: subscription.ID,
+				ID:      subscription.Items.Data[0].Price.ID,
+			},
+			Valid: false,
+		}
+		err = db.InsertMobileSubscription(tx, userID, details, details.Transaction.Type, details.Transaction.Receipt, 0, "", subscription.ID)
+		if err != nil {
+			return err
+		}
+	}
+	err = tx.Commit()
+
+	return err
+}
+
+func emailCustomerAboutFailedPayment(email string) {
+	msg := fmt.Sprintf("Payment processing failed. Could not activate your subscription. Please contact support at " + utils.Config.Frontend.Mail.Contact.SupportEmail + ". Manage Subscription: https://" + utils.Config.Frontend.SiteDomain + "/user/settings")
 	// escape html
 	msg = template.HTMLEscapeString(msg)
-	err := mail.SendMail(email, "Failed Payment", msg)
+	err := mail.SendTextMail(email, "Failed Payment", msg, []types.EmailAttachment{})
 	if err != nil {
 		logger.Errorf("error sending failed payment mail: %v", err)
 		return
 	}
 }
 
-func EmailCustomerAboutPlanChange(email string) {
-	msg := fmt.Sprintf("You have successfully changed your payment plan")
+func emailCustomerAboutPlanChange(email, plan string) {
+	p := "Sapphire"
+	isApi := false
+	if plan == utils.Config.Frontend.Stripe.Emerald {
+		p = "Emerald"
+		isApi = true
+	} else if plan == utils.Config.Frontend.Stripe.Diamond {
+		p = "Diamond"
+		isApi = true
+	} else if plan == utils.Config.Frontend.Stripe.Plankton {
+		p = "Plankton"
+		isApi = true
+	} else if plan == utils.Config.Frontend.Stripe.Goldfish {
+		p = "Goldfish"
+	} else if plan == utils.Config.Frontend.Stripe.Whale {
+		p = "Whale"
+	} else if plan == utils.Config.Frontend.Stripe.Iron {
+		p = "Iron"
+		isApi = true
+	} else if plan == utils.Config.Frontend.Stripe.Silver {
+		p = "Silver"
+		isApi = true
+	} else if plan == utils.Config.Frontend.Stripe.Gold {
+		p = "Gold"
+		isApi = true
+	} else if plan == utils.Config.Frontend.Stripe.Guppy {
+		p = "Guppy"
+	} else if plan == utils.Config.Frontend.Stripe.Dolphin {
+		p = "Dolphin"
+	} else if plan == utils.Config.Frontend.Stripe.Orca {
+		p = "Orca"
+	} else if plan == utils.Config.Frontend.Stripe.IronYearly {
+		p = "Iron (yearly)"
+		isApi = true
+	} else if plan == utils.Config.Frontend.Stripe.SilverYearly {
+		p = "Silver (yearly)"
+		isApi = true
+	} else if plan == utils.Config.Frontend.Stripe.GoldYearly {
+		p = "Gold (yearly)"
+		isApi = true
+	} else if plan == utils.Config.Frontend.Stripe.GuppyYearly {
+		p = "Guppy (yearly)"
+	} else if plan == utils.Config.Frontend.Stripe.DolphinYearly {
+		p = "Dolphin (yearly)"
+	} else if plan == utils.Config.Frontend.Stripe.OrcaYearly {
+		p = "Orca (yearly)"
+	}
+	page := "/user/settings#api"
+	if !isApi {
+		page = "/premium"
+	}
+	msg := fmt.Sprintf("You have successfully changed your payment plan to " + p + " to manage your subscription go to https://" + utils.Config.Frontend.SiteDomain + page)
 	// escape html
 	msg = template.HTMLEscapeString(msg)
-	err := mail.SendMail(email, "Payment Plan Change", msg)
+	err := mail.SendTextMail(email, "Payment Plan Change", msg, []types.EmailAttachment{})
 	if err != nil {
 		logger.Errorf("error sending order fulfillment email: %v", err)
 		return

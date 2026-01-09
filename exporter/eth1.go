@@ -2,13 +2,14 @@ package exporter
 
 import (
 	"context"
-	"eth2-exporter/db"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
 	"fmt"
 	"math/big"
 	"regexp"
 	"time"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
@@ -16,20 +17,16 @@ import (
 	gethTypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
 	gethRPC "github.com/ethereum/go-ethereum/rpc"
-	ethpb "github.com/prysmaticlabs/ethereumapis/eth/v1alpha1"
-	"github.com/prysmaticlabs/go-ssz"
-	contracts "github.com/prysmaticlabs/prysm/contracts/deposit-contract"
-	pb "github.com/prysmaticlabs/prysm/proto/beacon/p2p/v1"
-	"github.com/prysmaticlabs/prysm/shared/bls"
-	"github.com/prysmaticlabs/prysm/shared/bytesutil"
-	"github.com/prysmaticlabs/prysm/shared/hashutil"
-	"github.com/prysmaticlabs/prysm/shared/params"
+	"github.com/prysmaticlabs/prysm/v5/contracts/deposit"
+	"github.com/prysmaticlabs/prysm/v5/crypto/hash"
+	"github.com/prysmaticlabs/prysm/v5/encoding/bytesutil"
+	ethpb "github.com/prysmaticlabs/prysm/v5/proto/prysm/v1alpha1"
 	"github.com/sirupsen/logrus"
 )
 
 var eth1LookBack = uint64(100)
 var eth1MaxFetch = uint64(1000)
-var eth1DepositEventSignature = hashutil.HashKeccak256([]byte("DepositEvent(bytes,bytes,bytes,bytes,bytes)"))
+var eth1DepositEventSignature = hash.Keccak256([]byte("DepositEvent(bytes,bytes,bytes,bytes,bytes)"))
 var eth1DepositContractFirstBlock uint64
 var eth1DepositContractAddress common.Address
 var eth1Client *ethclient.Client
@@ -42,12 +39,12 @@ var gethRequestEntityTooLargeRE = regexp.MustCompile("413 Request Entity Too Lar
 // If a reorg of the eth1-chain happened within these 100 blocks it will delete
 // removed deposits.
 func eth1DepositsExporter() {
-	eth1DepositContractAddress = common.HexToAddress(utils.Config.Indexer.Eth1DepositContractAddress)
+	eth1DepositContractAddress = common.HexToAddress(utils.Config.Chain.ClConfig.DepositContractAddress)
 	eth1DepositContractFirstBlock = utils.Config.Indexer.Eth1DepositContractFirstBlock
 
-	rpcClient, err := gethRPC.Dial(utils.Config.Indexer.Eth1Endpoint)
+	rpcClient, err := gethRPC.Dial(utils.Config.Eth1GethEndpoint)
 	if err != nil {
-		logger.Fatal(err)
+		utils.LogFatal(err, "new exporter geth client error", 0)
 	}
 	eth1RPCClient = rpcClient
 	client := ethclient.NewClient(rpcClient)
@@ -59,18 +56,23 @@ func eth1DepositsExporter() {
 		t0 := time.Now()
 
 		var lastDepositBlock uint64
-		err = db.DB.Get(&lastDepositBlock, "select coalesce(max(block_number),0) from eth1_deposits")
+		err = db.WriterDb.Get(&lastDepositBlock, "select coalesce(max(block_number),0) from eth1_deposits")
 		if err != nil {
 			logger.WithError(err).Errorf("error retrieving highest block_number of eth1-deposits from db")
 			time.Sleep(time.Second * 5)
 			continue
 		}
-		header, err := eth1Client.HeaderByNumber(context.Background(), nil)
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+		header, err := eth1Client.HeaderByNumber(ctx, nil)
 		if err != nil {
 			logger.WithError(err).Errorf("error getting header from eth1-client")
+			cancel()
 			time.Sleep(time.Second * 5)
 			continue
 		}
+		cancel()
+
 		blockHeight := header.Number.Uint64()
 
 		fromBlock := lastDepositBlock + 1
@@ -85,15 +87,19 @@ func eth1DepositsExporter() {
 			fromBlock = lastFetchedBlock + 1
 		}
 		// if we are not synced to the head yet fetch missing blocks in batches of size 1000
-		if toBlock-fromBlock > eth1MaxFetch {
-			toBlock = fromBlock + 1000
+		if toBlock > fromBlock+eth1MaxFetch {
+			toBlock = fromBlock + eth1MaxFetch
 		}
 		if toBlock > blockHeight {
 			toBlock = blockHeight
 		}
 		// if we are synced to the head look at the last 100 blocks
-		if toBlock-fromBlock < eth1LookBack {
-			fromBlock = toBlock - 100
+		if toBlock < fromBlock+eth1LookBack {
+			if toBlock > eth1LookBack {
+				fromBlock = toBlock - eth1LookBack
+			} else {
+				fromBlock = 0
+			}
 		}
 
 		depositsToSave, err := fetchEth1Deposits(fromBlock, toBlock)
@@ -123,13 +129,15 @@ func eth1DepositsExporter() {
 		// make sure we are progressing even if there are no deposits in the last batch
 		lastFetchedBlock = toBlock
 
-		logger.WithFields(logrus.Fields{
-			"duration":      time.Since(t0),
-			"blockHeight":   blockHeight,
-			"fromBlock":     fromBlock,
-			"toBlock":       toBlock,
-			"depositsSaved": len(depositsToSave),
-		}).Info("exported eth1-deposits")
+		if len(depositsToSave) > 0 {
+			logger.WithFields(logrus.Fields{
+				"duration":      time.Since(t0),
+				"blockHeight":   blockHeight,
+				"fromBlock":     fromBlock,
+				"toBlock":       toBlock,
+				"depositsSaved": len(depositsToSave),
+			}).Info("exported eth1-deposits")
+		}
 
 		// progress faster if we are not synced to head yet
 		if blockHeight != toBlock {
@@ -137,20 +145,24 @@ func eth1DepositsExporter() {
 			continue
 		}
 
-		time.Sleep(time.Second * 60)
+		time.Sleep(time.Minute)
 	}
 }
 
 func fetchEth1Deposits(fromBlock, toBlock uint64) (depositsToSave []*types.Eth1Deposit, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+	defer cancel()
+	topic := common.BytesToHash(eth1DepositEventSignature[:])
 	qry := ethereum.FilterQuery{
 		Addresses: []common.Address{
 			eth1DepositContractAddress,
 		},
 		FromBlock: new(big.Int).SetUint64(fromBlock),
 		ToBlock:   new(big.Int).SetUint64(toBlock),
+		Topics:    [][]common.Hash{{topic}},
 	}
 
-	depositLogs, err := eth1Client.FilterLogs(context.Background(), qry)
+	depositLogs, err := eth1Client.FilterLogs(ctx, qry)
 	if err != nil {
 		return depositsToSave, fmt.Errorf("error getting logs from eth1-client: %w", err)
 	}
@@ -158,20 +170,25 @@ func fetchEth1Deposits(fromBlock, toBlock uint64) (depositsToSave []*types.Eth1D
 	blocksToFetch := []uint64{}
 	txsToFetch := []string{}
 
+	domain, err := utils.GetSigningDomain()
+	if err != nil {
+		return nil, err
+	}
+
 	for _, depositLog := range depositLogs {
 		if depositLog.Topics[0] != eth1DepositEventSignature {
 			continue
 		}
-		pubkey, withdrawalCredentials, amount, signature, merkletreeIndex, err := contracts.UnpackDepositLogData(depositLog.Data)
+		pubkey, withdrawalCredentials, amount, signature, merkletreeIndex, err := deposit.UnpackDepositLogData(depositLog.Data)
 		if err != nil {
 			return depositsToSave, fmt.Errorf("error unpacking eth1-deposit-log: %x: %w", depositLog.Data, err)
 		}
-		err = VerifyEth1DepositSignature(&ethpb.Deposit_Data{
+		err = deposit.VerifyDepositSignature(&ethpb.Deposit_Data{
 			PublicKey:             pubkey,
 			WithdrawalCredentials: withdrawalCredentials,
 			Amount:                bytesutil.FromBytes8(amount),
 			Signature:             signature,
-		})
+		}, domain)
 		validSignature := err == nil
 		blocksToFetch = append(blocksToFetch, depositLog.BlockNumber)
 		txsToFetch = append(txsToFetch, depositLog.TxHash.Hex())
@@ -191,7 +208,7 @@ func fetchEth1Deposits(fromBlock, toBlock uint64) (depositsToSave []*types.Eth1D
 
 	headers, txs, err := eth1BatchRequestHeadersAndTxs(blocksToFetch, txsToFetch)
 	if err != nil {
-		return depositsToSave, fmt.Errorf("error getting eth1-blocks: %w", err)
+		return depositsToSave, fmt.Errorf("error getting eth1-blocks: %w\nblocks to fetch: %v\n tx to fetch: %v", err, blocksToFetch, txsToFetch)
 	}
 
 	for _, d := range depositsToSave {
@@ -212,10 +229,10 @@ func fetchEth1Deposits(fromBlock, toBlock uint64) (depositsToSave []*types.Eth1D
 		if chainID == nil {
 			return depositsToSave, fmt.Errorf("error getting tx-chainId for eth1-deposit")
 		}
-		signer := gethTypes.NewEIP155Signer(chainID)
+		signer := gethTypes.NewPragueSigner(chainID)
 		sender, err := signer.Sender(tx)
 		if err != nil {
-			return depositsToSave, fmt.Errorf("error getting sender for eth1-deposit")
+			return depositsToSave, fmt.Errorf("error getting sender for eth1-deposit (txHash: %x, chainID: %v): %w", d.TxHash, chainID, err)
 		}
 		d.FromAddress = sender.Bytes()
 	}
@@ -224,7 +241,7 @@ func fetchEth1Deposits(fromBlock, toBlock uint64) (depositsToSave []*types.Eth1D
 }
 
 func saveEth1Deposits(depositsToSave []*types.Eth1Deposit) error {
-	tx, err := db.DB.Begin()
+	tx, err := db.WriterDb.Begin()
 	if err != nil {
 		return err
 	}
@@ -238,6 +255,7 @@ func saveEth1Deposits(depositsToSave []*types.Eth1Deposit) error {
 			block_number,
 			block_ts,
 			from_address,
+			from_address_text,
 			publickey,
 			withdrawal_credentials,
 			amount,
@@ -246,13 +264,14 @@ func saveEth1Deposits(depositsToSave []*types.Eth1Deposit) error {
 			removed,
 			valid_signature
 		)
-		VALUES ($1, $2, $3, $4, TO_TIMESTAMP($5), $6, $7, $8, $9, $10, $11, $12, $13)
-		ON CONFLICT (tx_hash, merkletree_index) DO UPDATE SET
+		VALUES ($1, $2, $3, $4, TO_TIMESTAMP($5), $6, ENCODE($7, 'hex'), $8, $9, $10, $11, $12, $13, $14)
+		ON CONFLICT (merkletree_index) DO UPDATE SET
 			tx_input               = EXCLUDED.tx_input,
 			tx_index               = EXCLUDED.tx_index,
 			block_number           = EXCLUDED.block_number,
 			block_ts               = EXCLUDED.block_ts,
 			from_address           = EXCLUDED.from_address,
+			from_address_text      = EXCLUDED.from_address_text,
 			publickey              = EXCLUDED.publickey,
 			withdrawal_credentials = EXCLUDED.withdrawal_credentials,
 			amount                 = EXCLUDED.amount,
@@ -266,7 +285,7 @@ func saveEth1Deposits(depositsToSave []*types.Eth1Deposit) error {
 	defer insertDepositStmt.Close()
 
 	for _, d := range depositsToSave {
-		_, err := insertDepositStmt.Exec(d.TxHash, d.TxInput, d.TxIndex, d.BlockNumber, d.BlockTs, d.FromAddress, d.PublicKey, d.WithdrawalCredentials, d.Amount, d.Signature, d.MerkletreeIndex, d.Removed, d.ValidSignature)
+		_, err := insertDepositStmt.Exec(d.TxHash, d.TxInput, d.TxIndex, d.BlockNumber, d.BlockTs, d.FromAddress, d.FromAddress, d.PublicKey, d.WithdrawalCredentials, d.Amount, d.Signature, d.MerkletreeIndex, d.Removed, d.ValidSignature)
 		if err != nil {
 			return fmt.Errorf("error saving eth1-deposit to db: %v: %w", fmt.Sprintf("%x", d.TxHash), err)
 		}
@@ -274,7 +293,7 @@ func saveEth1Deposits(depositsToSave []*types.Eth1Deposit) error {
 
 	err = tx.Commit()
 	if err != nil {
-		return fmt.Errorf("error commiting db-tx for eth1-deposits: %w", err)
+		return fmt.Errorf("error committing db-tx for eth1-deposits: %w", err)
 	}
 
 	return nil
@@ -315,13 +334,24 @@ func eth1BatchRequestHeadersAndTxs(blocksToFetch []uint64, txsToFetch []string) 
 		errors = append(errors, err)
 	}
 
-	if len(elems) == 0 {
+	lenElems := len(elems)
+
+	if lenElems == 0 {
 		return headers, txs, nil
 	}
 
-	ioErr := eth1RPCClient.BatchCall(elems)
-	if ioErr != nil {
-		return nil, nil, ioErr
+	for i := 0; (i * 100) < lenElems; i++ {
+		start := (i * 100)
+		end := start + 100
+
+		if end > lenElems {
+			end = lenElems
+		}
+
+		ioErr := eth1RPCClient.BatchCall(elems[start:end])
+		if ioErr != nil {
+			return nil, nil, ioErr
+		}
 	}
 
 	for _, e := range errors {
@@ -331,114 +361,4 @@ func eth1BatchRequestHeadersAndTxs(blocksToFetch []uint64, txsToFetch []string) 
 	}
 
 	return headers, txs, nil
-}
-
-// From: "github.com/prysmaticlabs/prysm/beacon-chain/core/helpers"
-// Avoid including dependency directly as it triggers a
-// Cloudflare roughtime call that blocks startup for
-// several seconds
-// ForkVersionByteLength length of fork version byte array.
-const ForkVersionByteLength = 4
-
-// DomainByteLength length of domain byte array.
-const DomainByteLength = 4
-
-func ComputeDomain(domainType [DomainByteLength]byte, forkVersion []byte, genesisValidatorsRoot []byte) ([]byte, error) {
-	if forkVersion == nil {
-		forkVersion = params.BeaconConfig().GenesisForkVersion
-	}
-	if genesisValidatorsRoot == nil {
-		genesisValidatorsRoot = params.BeaconConfig().ZeroHash[:]
-	}
-	forkBytes := [ForkVersionByteLength]byte{}
-	copy(forkBytes[:], forkVersion)
-
-	forkDataRoot, err := computeForkDataRoot(forkBytes[:], genesisValidatorsRoot)
-	if err != nil {
-		return nil, err
-	}
-
-	return domain(domainType, forkDataRoot[:]), nil
-}
-
-func domain(domainType [DomainByteLength]byte, forkDataRoot []byte) []byte {
-	b := []byte{}
-	b = append(b, domainType[:4]...)
-	b = append(b, forkDataRoot[:28]...)
-	return b
-}
-
-func computeForkDataRoot(version []byte, root []byte) ([32]byte, error) {
-	r, err := ssz.HashTreeRoot(&pb.ForkData{
-		CurrentVersion:        version,
-		GenesisValidatorsRoot: root,
-	})
-	if err != nil {
-		return [32]byte{}, err
-	}
-	return r, nil
-}
-
-func VerifyEth1DepositSignature(obj *ethpb.Deposit_Data) error {
-	cfg := params.BeaconConfig()
-	if utils.Config.Chain.Network == "altona" {
-		cfg = params.AltonaConfig()
-	} else if utils.Config.Chain.Network == "medalla" {
-		cfg = params.MedallaConfig()
-	} else if utils.Config.Chain.Network == "spadina" {
-		cfg = params.SpadinaConfig()
-	}
-	domain, err := ComputeDomain(
-		cfg.DomainDeposit,
-		cfg.GenesisForkVersion,
-		cfg.ZeroHash[:],
-	)
-	if utils.Config.Chain.Network == "zinken" {
-		domain, err = ComputeDomain(
-			cfg.DomainDeposit,
-			[]byte{0x00, 0x00, 0x00, 0x03},
-			cfg.ZeroHash[:],
-		)
-	}
-	if utils.Config.Chain.Network == "toledo" {
-		domain, err = ComputeDomain(
-			cfg.DomainDeposit,
-			[]byte{0x00, 0x70, 0x1E, 0xD0},
-			cfg.ZeroHash[:],
-		)
-	}
-	if utils.Config.Chain.Network == "pyrmont" {
-		domain, err = ComputeDomain(
-			cfg.DomainDeposit,
-			[]byte{0x00, 0x00, 0x20, 0x09},
-			cfg.ZeroHash[:],
-		)
-	}
-	if err != nil {
-		return fmt.Errorf("could not get domain: %w", err)
-	}
-	blsPubkey, err := bls.PublicKeyFromBytes(obj.PublicKey)
-	if err != nil {
-		return fmt.Errorf("could not get pubkey: %w", err)
-	}
-	blsSig, err := bls.SignatureFromBytes(obj.Signature)
-	if err != nil {
-		return fmt.Errorf("could not get sig %w", err)
-	}
-	root, err := ssz.SigningRoot(obj)
-	if err != nil {
-		return fmt.Errorf("could not get root: %w", err)
-	}
-	signingData := &pb.SigningData{
-		ObjectRoot: root[:],
-		Domain:     domain,
-	}
-	ctrRoot, err := ssz.HashTreeRoot(signingData)
-	if err != nil {
-		return fmt.Errorf("could not get ctr root: %w", err)
-	}
-	if !blsSig.Verify(blsPubkey, ctrRoot[:]) {
-		return fmt.Errorf("invalid signature")
-	}
-	return nil
 }

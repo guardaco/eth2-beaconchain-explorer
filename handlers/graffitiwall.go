@@ -1,20 +1,17 @@
 package handlers
 
 import (
-	"eth2-exporter/db"
-	"eth2-exporter/services"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
-	"eth2-exporter/version"
-	"fmt"
-	"html/template"
 	"net/http"
-	"time"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	"github.com/gobitfly/eth2-beaconchain-explorer/templates"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 )
 
-var graffitiwallTemplate = template.Must(template.New("vis").ParseFiles("templates/layout.html", "templates/graffitiwall.html"))
-
 func Graffitiwall(w http.ResponseWriter, r *http.Request) {
+	templateFiles := append(layoutTemplateFiles, "graffitiwall.html")
+	var graffitiwallTemplate = templates.GetTemplate(templateFiles...)
 
 	var err error
 
@@ -22,43 +19,19 @@ func Graffitiwall(w http.ResponseWriter, r *http.Request) {
 
 	var graffitiwallData []*types.GraffitiwallData
 
-	err = db.DB.Select(&graffitiwallData, "select x, y, color, slot, validator from graffitiwall")
+	// only fetch latest entry for each pixel
+	err = db.ReaderDb.Select(&graffitiwallData, "SELECT DISTINCT ON (x, y) x, y, color, slot, validator from graffitiwall ORDER BY x, y, slot DESC")
 
 	if err != nil {
-		logger.Errorf("error retrieving block tree data: %v", err)
-		http.Error(w, "Internal server error", 503)
+		utils.LogError(err, "error retrieving graffitiwall data", 0)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
-	data := &types.PageData{
-		HeaderAd: true,
-		Meta: &types.Meta{
-			Title:       fmt.Sprintf("%v - Graffitiwall - beaconcha.in - %v", utils.Config.Frontend.SiteName, time.Now().Year()),
-			Description: "beaconcha.in makes the Ethereum 2.0. beacon chain accessible to non-technical end users",
-			Path:        "/graffitiwall",
-			GATag:       utils.Config.Frontend.GATag,
-		},
-		ShowSyncingMessage:    services.IsSyncing(),
-		Active:                "more",
-		Data:                  graffitiwallData,
-		User:                  getUser(w, r),
-		Version:               version.Version,
-		ChainSlotsPerEpoch:    utils.Config.Chain.SlotsPerEpoch,
-		ChainSecondsPerSlot:   utils.Config.Chain.SecondsPerSlot,
-		ChainGenesisTimestamp: utils.Config.Chain.GenesisTimestamp,
-		CurrentEpoch:          services.LatestEpoch(),
-		CurrentSlot:           services.LatestSlot(),
-		FinalizationDelay:     services.FinalizationDelay(),
-		EthPrice:              services.GetEthPrice(),
-		Mainnet:               utils.Config.Chain.Mainnet,
-		DepositContract:       utils.Config.Indexer.Eth1DepositContractAddress,
-	}
+	data := InitPageData(w, r, "more", "/graffitiwall", "Graffitiwall", templateFiles)
+	data.Data = graffitiwallData
 
-	err = graffitiwallTemplate.ExecuteTemplate(w, "layout", data)
-
-	if err != nil {
-		logger.Errorf("error executing template for %v route: %v", r.URL.String(), err)
-		http.Error(w, "Internal server error", 503)
-		return
+	if handleTemplateError(w, r, "graffitiwall.go", "Graffitiwall", "", graffitiwallTemplate.ExecuteTemplate(w, "layout", data)) != nil {
+		return // an error has occurred and was processed
 	}
 }

@@ -1,168 +1,204 @@
 package handlers
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
-	"eth2-exporter/db"
-	"eth2-exporter/services"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
-	"eth2-exporter/version"
+	"errors"
 	"fmt"
-	"html/template"
 	"net/http"
-	"time"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	"github.com/gobitfly/eth2-beaconchain-explorer/services"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
+	"github.com/lib/pq"
 
 	"strconv"
 	"strings"
 
-	"github.com/lib/pq"
+	"github.com/ethereum/go-ethereum/common"
+	"golang.org/x/sync/errgroup"
 )
 
-var dashboardTemplate = template.Must(template.New("dashboard").Funcs(utils.GetTemplateFuncs()).ParseFiles("templates/layout.html", "templates/dashboard.html"))
+var ErrTooManyValidators = errors.New("too many validators")
 
-func parseValidatorsFromQueryString(str string) ([]uint64, error) {
+func handleValidatorsQuery(w http.ResponseWriter, r *http.Request, checkValidatorLimit bool) ([]uint64, [][]byte, bool, error) {
+	q := r.URL.Query()
+	validatorLimit := getUserPremium(r).MaxValidators
+
+	errFieldMap := map[string]interface{}{"route": r.URL.String()}
+
+	// Parse all the validator indices and pubkeys from the query string
+	queryValidatorIndices, queryValidatorPubkeys, err := parseValidatorsFromQueryString(q.Get("validators"), validatorLimit)
+	if err != nil && (checkValidatorLimit || err != ErrTooManyValidators) {
+		logger.Warnf("could not parse validators from query string: %v; Route: %v", err, r.URL.String())
+		http.Error(w, "Invalid query", http.StatusBadRequest)
+		return nil, nil, false, err
+	}
+
+	// Check whether pubkeys can be converted to indices and redirect if necessary
+	redirect, err := updateValidatorsQueryString(w, r, queryValidatorIndices, queryValidatorPubkeys)
+	if err != nil {
+		utils.LogError(err, fmt.Errorf("error finding validators in database for dashboard query update"), 0, errFieldMap)
+		http.Error(w, "Not found", http.StatusNotFound)
+		return nil, nil, false, err
+	}
+
+	if !redirect {
+		// Check after the redirect whether all validators are correct
+		err = checkValidatorsQuery(queryValidatorIndices, queryValidatorPubkeys)
+		if err != nil {
+			logger.Warnf("could not find validators in database from query string: %v; Route: %v", err, r.URL.String())
+			http.Error(w, "Not found", http.StatusNotFound)
+			return nil, nil, false, err
+		}
+	}
+
+	return queryValidatorIndices, queryValidatorPubkeys, redirect, nil
+}
+
+// parseValidatorsFromQueryString returns a slice of validator indices and a slice of validator pubkeys from a parsed query string
+func parseValidatorsFromQueryString(str string, validatorLimit int) ([]uint64, [][]byte, error) {
 	if str == "" {
-		return []uint64{}, nil
+		return []uint64{}, [][]byte{}, nil
 	}
 
 	strSplit := strings.Split(str, ",")
 	strSplitLen := len(strSplit)
 
-	// we only support up to 100 validators
-	if strSplitLen > 100 {
-		return []uint64{}, fmt.Errorf("Too much validators")
+	// we only support up to [validatorLimit] validators
+	if strSplitLen > validatorLimit {
+		return []uint64{}, [][]byte{}, ErrTooManyValidators
 	}
 
-	validators := make([]uint64, strSplitLen)
-	keys := make(map[uint64]bool, strSplitLen)
+	var validatorIndices []uint64
+	var validatorPubkeys [][]byte
+	keys := make(map[interface{}]bool, strSplitLen)
 
-	for i, vStr := range strSplit {
+	// Find all pubkeys
+	for _, vStr := range strSplit {
+		if !searchPubkeyExactRE.MatchString(vStr) {
+			continue
+		}
+		if !strings.HasPrefix(vStr, "0x") {
+			// Query string public keys have to have 0x prefix
+			return []uint64{}, [][]byte{}, fmt.Errorf("invalid pubkey")
+		}
+		// make sure keys are unique
+		if exists := keys[vStr]; exists {
+			continue
+		}
+		keys[vStr] = true
+		validatorPubkeys = append(validatorPubkeys, common.FromHex(vStr))
+
+	}
+
+	// Find all indices
+	for _, vStr := range strSplit {
+		if searchPubkeyExactRE.MatchString(vStr) {
+			continue
+		}
 		v, err := strconv.ParseUint(vStr, 10, 64)
 		if err != nil {
-			return []uint64{}, err
+			return []uint64{}, [][]byte{}, err
 		}
-		// make sure keys are uniq
+		// make sure keys are unique
 		if exists := keys[v]; exists {
 			continue
 		}
 		keys[v] = true
-		validators[i] = v
+		validatorIndices = append(validatorIndices, v)
 	}
 
-	return validators, nil
+	return validatorIndices, validatorPubkeys, nil
 }
 
-func Dashboard(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html")
-
-	dashboardData := types.DashboardData{}
-
-	data := &types.PageData{
-		HeaderAd: true,
-		Meta: &types.Meta{
-			Title:       fmt.Sprintf("%v - Dashboard - beaconcha.in - %v", utils.Config.Frontend.SiteName, time.Now().Year()),
-			Description: "beaconcha.in makes the Ethereum 2.0. beacon chain accessible to non-technical end users",
-			Path:        "/dashboard",
-			GATag:       utils.Config.Frontend.GATag,
-		},
-		ShowSyncingMessage:    services.IsSyncing(),
-		Active:                "dashboard",
-		Data:                  dashboardData,
-		User:                  getUser(w, r),
-		Version:               version.Version,
-		ChainSlotsPerEpoch:    utils.Config.Chain.SlotsPerEpoch,
-		ChainSecondsPerSlot:   utils.Config.Chain.SecondsPerSlot,
-		ChainGenesisTimestamp: utils.Config.Chain.GenesisTimestamp,
-		CurrentEpoch:          services.LatestEpoch(),
-		CurrentSlot:           services.LatestSlot(),
-		FinalizationDelay:     services.FinalizationDelay(),
-		EthPrice:              services.GetEthPrice(),
-		Mainnet:               utils.Config.Chain.Mainnet,
-		DepositContract:       utils.Config.Indexer.Eth1DepositContractAddress,
+func updateValidatorsQueryString(w http.ResponseWriter, r *http.Request, validatorIndices []uint64, validatorPubkeys [][]byte) (bool, error) {
+	validatorsCount := len(validatorIndices) + len(validatorPubkeys)
+	if validatorsCount == 0 {
+		return false, nil
 	}
 
-	err := dashboardTemplate.ExecuteTemplate(w, "layout", data)
-	if err != nil {
-		logger.WithError(err).WithField("route", r.URL.String()).Error("error executing template")
-		http.Error(w, "Internal server error", 503)
-		return
+	// Convert pubkeys to indices if possible
+	// validatorsCount stays the same after conversion
+	redirect := false
+	if len(validatorPubkeys) > 0 {
+		validatorInfos := []struct {
+			Index  uint64
+			Pubkey []byte
+		}{}
+		err := db.ReaderDb.Select(&validatorInfos, `SELECT validatorindex as index, pubkey FROM validators WHERE pubkey = ANY($1)`, validatorPubkeys)
+		if err != nil {
+			return false, err
+		}
+
+		for _, info := range validatorInfos {
+			// Having duplicates of validator indices is not a problem so we don't need to check for that
+			validatorIndices = append(validatorIndices, info.Index)
+
+			redirect = true
+			for idx, pubkey := range validatorPubkeys {
+				if bytes.Contains(pubkey, info.Pubkey) {
+					validatorPubkeys = append(validatorPubkeys[:idx], validatorPubkeys[idx+1:]...)
+					break
+				}
+			}
+		}
 	}
+
+	if redirect {
+		strValidators := make([]string, validatorsCount)
+		for i, n := range validatorIndices {
+			strValidators[i] = fmt.Sprintf("%v", n)
+		}
+		for i, n := range validatorPubkeys {
+			strValidators[i+len(validatorIndices)] = fmt.Sprintf("%#x", n)
+		}
+
+		q := r.URL.Query()
+		q.Set("validators", strings.Join(strValidators, ","))
+		r.URL.RawQuery = q.Encode()
+
+		http.Redirect(w, r, r.URL.String(), http.StatusSeeOther)
+	}
+	return redirect, nil
 }
 
-func DashboardDataBalance(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
+func checkValidatorsQuery(validatorIndices []uint64, validatorPubkeys [][]byte) error {
+	validatorCount := 0
 
-	q := r.URL.Query()
-
-	queryValidators, err := parseValidatorsFromQueryString(q.Get("validators"))
-	if err != nil {
-		logger.WithError(err).WithField("route", r.URL.String()).Error("error parsing validators from query string")
-		http.Error(w, "Invalid query", 400)
-		return
-	}
-	if err != nil {
-		http.Error(w, "Invalid query", 400)
-		return
-	}
-	if len(queryValidators) < 1 {
-		http.Error(w, "Invalid query", 400)
-		return
-	}
-	queryValidatorsArr := pq.Array(queryValidators)
-
-	// get data from one week before latest epoch
-	latestEpoch := services.LatestEpoch()
-	oneWeekEpochs := uint64(3600 * 24 * 7 / float64(utils.Config.Chain.SecondsPerSlot*utils.Config.Chain.SlotsPerEpoch))
-	queryOffsetEpoch := uint64(0)
-	if latestEpoch > oneWeekEpochs {
-		queryOffsetEpoch = latestEpoch - oneWeekEpochs
+	if len(validatorIndices) > 0 {
+		err := db.ReaderDb.Get(&validatorCount, `SELECT COUNT(*) FROM validators WHERE validatorindex = ANY($1)`, validatorIndices)
+		if err != nil {
+			return err
+		}
+		if validatorCount != len(validatorIndices) {
+			return fmt.Errorf("invalid validator index")
+		}
 	}
 
-	query := `
-		SELECT
-			epoch,
-			COALESCE(SUM(effectivebalance),0) AS effectivebalance,
-			COALESCE(SUM(balance),0) AS balance,
-			COUNT(*) AS validatorcount
-		FROM validator_balances
-		WHERE validatorindex = ANY($1) AND epoch > $2
-		GROUP BY epoch
-		ORDER BY epoch ASC`
-
-	data := []*types.DashboardValidatorBalanceHistory{}
-	err = db.DB.Select(&data, query, queryValidatorsArr, queryOffsetEpoch)
-	if err != nil {
-		logger.WithError(err).WithField("route", r.URL.String()).Errorf("error retrieving validator balance history")
-		http.Error(w, "Internal server error", 503)
-		return
+	if len(validatorPubkeys) > 0 {
+		err := db.ReaderDb.Get(&validatorCount, `SELECT COUNT(DISTINCT publickey) AS distinct_count FROM eth1_deposits WHERE publickey = ANY($1)`, validatorPubkeys)
+		if err != nil {
+			return err
+		}
+		if validatorCount != len(validatorPubkeys) {
+			return fmt.Errorf("invalid validator public key")
+		}
 	}
 
-	balanceHistoryChartData := make([][4]float64, len(data))
-	for i, item := range data {
-		balanceHistoryChartData[i][0] = float64(utils.EpochToTime(item.Epoch).Unix() * 1000)
-		balanceHistoryChartData[i][1] = item.ValidatorCount
-		balanceHistoryChartData[i][2] = float64(item.Balance) / 1e9
-		balanceHistoryChartData[i][3] = float64(item.EffectiveBalance) / 1e9
-	}
-
-	err = json.NewEncoder(w).Encode(balanceHistoryChartData)
-	if err != nil {
-		logger.WithError(err).WithField("route", r.URL.String()).Error("error enconding json response")
-		http.Error(w, "Internal server error", 503)
-		return
-	}
+	return nil
 }
 
 func DashboardDataProposals(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	q := r.URL.Query()
-
-	filterArr, err := parseValidatorsFromQueryString(q.Get("validators"))
-	if err != nil {
-		http.Error(w, "Invalid query", 400)
+	filterArr, _, redirect, err := handleValidatorsQuery(w, r, true)
+	if err != nil || redirect {
 		return
 	}
+
 	filter := pq.Array(filterArr)
 
 	proposals := []struct {
@@ -170,14 +206,16 @@ func DashboardDataProposals(w http.ResponseWriter, r *http.Request) {
 		Status uint64
 	}{}
 
-	err = db.DB.Select(&proposals, `
+	errFieldMap := map[string]interface{}{"route": r.URL.String()}
+
+	err = db.ReaderDb.Select(&proposals, `
 		SELECT slot, status
 		FROM blocks
 		WHERE proposer = ANY($1)
 		ORDER BY slot`, filter)
 	if err != nil {
-		logger.WithError(err).WithField("route", r.URL.String()).Error("error retrieving block-proposals")
-		http.Error(w, "Internal server error", 503)
+		utils.LogError(err, "error retrieving block-proposals", 0, errFieldMap)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
@@ -191,227 +229,81 @@ func DashboardDataProposals(w http.ResponseWriter, r *http.Request) {
 
 	err = json.NewEncoder(w).Encode(proposalsResult)
 	if err != nil {
-		logger.WithError(err).WithField("route", r.URL.String()).Error("error enconding json response")
-		http.Error(w, "Internal server error", 503)
+		utils.LogError(err, "error enconding json response", 0, errFieldMap)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 }
 
-func DashboardDataMissedAttestations(w http.ResponseWriter, r *http.Request) {
+// Dashboard Chart that combines balance data and
+func DashboardDataBalanceCombined(w http.ResponseWriter, r *http.Request) {
+	var lowerBoundDay uint64
+	param := r.URL.Query().Get("days")
+	if len(param) != 0 {
+		days, err := strconv.ParseUint(param, 10, 32)
+		if err != nil {
+			logger.Warnf("error parsing days: %v", err)
+			http.Error(w, "Error: invalid parameter days", http.StatusBadRequest)
+			return
+		}
+		lastStatsDay, err := services.LatestExportedStatisticDay()
+		if days < lastStatsDay && err == nil {
+			lowerBoundDay = lastStatsDay - days + 1
+		}
+	}
+
+	currency := GetCurrency(r)
+	errFieldMap := map[string]interface{}{"route": r.URL.String()}
+
 	w.Header().Set("Content-Type", "application/json")
 
-	q := r.URL.Query()
-
-	filterArr, err := parseValidatorsFromQueryString(q.Get("validators"))
-	if err != nil {
-		http.Error(w, "Invalid query", 400)
-		return
-	}
-	filter := pq.Array(filterArr)
-
-	missedAttestations := []struct {
-		Epoch          uint64
-		Validatorindex uint64
-	}{}
-
-	maxEpoch := services.LatestEpoch() - 1
-	minEpoch := utils.TimeToEpoch(time.Now().Add(time.Hour * 24 * -7))
-
-	err = db.DB.Select(&missedAttestations, `
-		SELECT epoch, validatorindex
-		FROM attestation_assignments
-		WHERE 
-			validatorindex = ANY($1) 
-			AND epoch <= $2 
-			AND epoch >= $3 
-			AND status = 0`, filter, maxEpoch, minEpoch)
-	if err != nil {
-		logger.WithError(err).WithField("route", r.URL.String()).Error("error retrieving daily proposed blocks blocks count")
-		http.Error(w, "Internal server error", 503)
+	queryValidatorIndices, _, redirect, err := handleValidatorsQuery(w, r, true)
+	if err != nil || redirect {
 		return
 	}
 
-	result := make(map[int64][]uint64)
+	if len(queryValidatorIndices) < 1 {
+		http.Error(w, "Invalid query", http.StatusBadRequest)
+		return
+	}
 
-	for _, ma := range missedAttestations {
-		ts := utils.EpochToTime(ma.Epoch).Unix()
-		if _, exists := result[ts]; !exists {
-			result[ts] = []uint64{ma.Validatorindex}
-		} else {
-			result[ts] = append(result[ts], ma.Validatorindex)
+	g, _ := errgroup.WithContext(context.Background())
+	var incomeHistoryChartData []*types.ChartDataPoint
+	var executionChartData []*types.ChartDataPoint
+	g.Go(func() error {
+		incomeHistoryChartData, err = db.GetValidatorIncomeHistoryChart(queryValidatorIndices, currency, services.LatestFinalizedEpoch(), lowerBoundDay)
+		if err != nil {
+			return fmt.Errorf("error in GetValidatorIncomeHistoryChart: %w", err)
 		}
-	}
+		return nil
+	})
 
-	err = json.NewEncoder(w).Encode(result)
-	if err != nil {
-		logger.WithError(err).WithField("route", r.URL.String()).Error("error enconding json response")
-		http.Error(w, "Internal server error", 503)
-		return
-	}
-}
-
-func DashboardDataValidators(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
-	q := r.URL.Query()
-
-	filterArr, err := parseValidatorsFromQueryString(q.Get("validators"))
-	if err != nil {
-		http.Error(w, "Invalid query", 400)
-		return
-	}
-	filter := pq.Array(filterArr)
-
-	latestEpoch := services.LatestEpoch()
-	validatorOnlineThresholdSlot := GetValidatorOnlineThresholdSlot()
-
-	var validators []*types.ValidatorsPageDataValidators
-	err = db.DB.Select(&validators, `
-		WITH
-			proposals AS (
-				SELECT validatorindex, pa.status, count(*)
-				FROM proposal_assignments pa
-				INNER JOIN blocks b ON pa.proposerslot = b.slot AND b.status <> '3'
-				WHERE validatorindex = ANY($3)
-				GROUP BY validatorindex, pa.status
-			)
-		SELECT
-			validators.validatorindex,
-			validators.pubkey,
-			validators.withdrawableepoch,
-			validators.balance,
-			validators.effectivebalance,
-			validators.slashed,
-			validators.activationeligibilityepoch,
-			validators.lastattestationslot,
-			validators.activationepoch,
-			validators.exitepoch,
-			a.state,
-			COALESCE(p1.count, 0) as executedproposals,
-			COALESCE(p2.count, 0) as missedproposals,
-			COALESCE(validator_performance.performance7d, 0) as performance7d,
-			COALESCE(validator_names.name, '') AS name
-		FROM validators
-		LEFT JOIN validator_names ON validators.pubkey = validator_names.publickey
-		INNER JOIN (
-			SELECT validatorindex,
-			CASE 
-				WHEN exitepoch <= $1 then 'exited'
-				WHEN activationepoch > $1 then 'pending'
-				WHEN slashed and activationepoch < $1 and (lastattestationslot < $2 OR lastattestationslot is null) then 'slashing_offline'
-				WHEN slashed then 'slashing_online'
-				WHEN activationepoch < $1 and (lastattestationslot < $2 OR lastattestationslot is null) then 'active_offline' 
-				ELSE 'active_online'
-			END AS state
-			FROM validators
-		) a ON a.validatorindex = validators.validatorindex
-		LEFT JOIN proposals p1 ON validators.validatorindex = p1.validatorindex AND p1.status = 1
-		LEFT JOIN proposals p2 ON validators.validatorindex = p2.validatorindex AND p2.status = 2
-		LEFT JOIN validator_performance ON validators.validatorindex = validator_performance.validatorindex
-		WHERE validators.validatorindex = ANY($3)
-		LIMIT 100`, latestEpoch, validatorOnlineThresholdSlot, filter)
-
-	if err != nil {
-		logger.WithError(err).WithField("route", r.URL.String()).Errorf("error retrieving validator data")
-		http.Error(w, "Internal server error", 503)
-		return
-	}
-
-	tableData := make([][]interface{}, len(validators))
-	for i, v := range validators {
-		tableData[i] = []interface{}{
-			fmt.Sprintf("%x", v.PublicKey),
-			fmt.Sprintf("%v", v.ValidatorIndex),
-			[]interface{}{
-				fmt.Sprintf("%.4f ETH", float64(v.CurrentBalance)/float64(1e9)),
-				fmt.Sprintf("%.1f ETH", float64(v.EffectiveBalance)/float64(1e9)),
-			},
-			v.State,
-			[]interface{}{
-				v.ActivationEpoch,
-				utils.EpochToTime(v.ActivationEpoch).Unix(),
-			},
+	g.Go(func() error {
+		executionChartData, err = getExecutionChartData(queryValidatorIndices, currency, lowerBoundDay)
+		if err != nil {
+			return fmt.Errorf("error in getExecutionChartData: %w", err)
 		}
+		return nil
+	})
 
-		if v.ExitEpoch != 9223372036854775807 {
-			tableData[i] = append(tableData[i], []interface{}{
-				v.ExitEpoch,
-				utils.EpochToTime(v.ExitEpoch).Unix(),
-			})
-		} else {
-			tableData[i] = append(tableData[i], nil)
-		}
-
-		if v.WithdrawableEpoch != 9223372036854775807 {
-			tableData[i] = append(tableData[i], []interface{}{
-				v.WithdrawableEpoch,
-				utils.EpochToTime(v.WithdrawableEpoch).Unix(),
-			})
-		} else {
-			tableData[i] = append(tableData[i], nil)
-		}
-
-		if v.LastAttestationSlot != nil {
-			tableData[i] = append(tableData[i], []interface{}{
-				*v.LastAttestationSlot,
-				utils.SlotToTime(uint64(*v.LastAttestationSlot)).Unix(),
-			})
-		} else {
-			tableData[i] = append(tableData[i], nil)
-		}
-
-		tableData[i] = append(tableData[i], []interface{}{
-			v.ExecutedProposals,
-			v.MissedProposals,
-		})
-
-		// tableData[i] = append(tableData[i], []interface{}{
-		// 	v.ExecutedAttestations,
-		// 	v.MissedAttestations,
-		// })
-
-		// tableData[i] = append(tableData[i], fmt.Sprintf("%.4f ETH", float64(v.Performance7d)/float64(1e9)))
-		tableData[i] = append(tableData[i], utils.FormatIncome(v.Performance7d))
-	}
-
-	type dataType struct {
-		LatestEpoch uint64          `json:"latestEpoch"`
-		Data        [][]interface{} `json:"data"`
-	}
-	data := &dataType{
-		LatestEpoch: services.LatestEpoch(),
-		Data:        tableData,
-	}
-
-	err = json.NewEncoder(w).Encode(data)
+	err = g.Wait()
 	if err != nil {
-		logger.WithError(err).WithField("route", r.URL.String()).Errorf("error enconding json response")
-		http.Error(w, "Internal server error", 503)
-		return
-	}
-}
-
-func DashboardDataEarnings(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
-	q := r.URL.Query()
-
-	queryValidators, err := parseValidatorsFromQueryString(q.Get("validators"))
-	if err != nil {
-		http.Error(w, "Invalid query", 400)
+		utils.LogError(err, "error while combining balance chart", 0, errFieldMap)
+		SendBadRequestResponse(w, r.URL.String(), err.Error())
 		return
 	}
 
-	earnings, err := GetValidatorEarnings(queryValidators)
-	if err != nil {
-		logger.WithError(err).WithField("route", r.URL.String()).Errorf("error retrieving validator earnings")
-		http.Error(w, "Internal server error", 503)
+	var response struct {
+		ConsensusChartData []*types.ChartDataPoint `json:"consensusChartData"`
+		ExecutionChartData []*types.ChartDataPoint `json:"executionChartData"`
 	}
+	response.ConsensusChartData = incomeHistoryChartData
+	response.ExecutionChartData = executionChartData
 
-	err = json.NewEncoder(w).Encode(earnings)
+	err = json.NewEncoder(w).Encode(response)
 	if err != nil {
-		logger.WithError(err).WithField("route", r.URL.String()).Errorf("error enconding json response")
-		http.Error(w, "Internal server error", 503)
+		utils.LogError(err, "error enconding json response", 0, errFieldMap)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 }

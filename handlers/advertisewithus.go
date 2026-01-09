@@ -1,68 +1,54 @@
 package handlers
 
 import (
-	"eth2-exporter/mail"
-	"eth2-exporter/services"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
-	"eth2-exporter/version"
 	"fmt"
 	"html/template"
 	"net/http"
-	"time"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/mail"
+	"github.com/gobitfly/eth2-beaconchain-explorer/templates"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 )
 
-var advertisewithusTemplate = template.Must(template.New("advertisewithus").Funcs(utils.GetTemplateFuncs()).ParseFiles("templates/layout.html", "templates/advertisewithus.html"))
-
 func AdvertiseWithUs(w http.ResponseWriter, r *http.Request) {
+	templateFiles := append(layoutTemplateFiles, "advertisewithus.html")
+	var advertisewithusTemplate = templates.GetTemplate(templateFiles...)
+
 	var err error
 
 	w.Header().Set("Content-Type", "text/html")
-	data := &types.PageData{
-		Meta: &types.Meta{
-			Title:       fmt.Sprintf("%v - Adverstise With Us - beaconcha.in - %v", utils.Config.Frontend.SiteName, time.Now().Year()),
-			Description: "beaconcha.in makes the Ethereum 2.0. beacon chain accessible to non-technical end users",
-			Path:        "/advertisewithus",
-			GATag:       utils.Config.Frontend.GATag,
-		},
-		ShowSyncingMessage:    services.IsSyncing(),
-		Active:                "advertisewithus",
-		User:                  getUser(w, r),
-		Version:               version.Version,
-		ChainSlotsPerEpoch:    utils.Config.Chain.SlotsPerEpoch,
-		ChainSecondsPerSlot:   utils.Config.Chain.SecondsPerSlot,
-		ChainGenesisTimestamp: utils.Config.Chain.GenesisTimestamp,
-		CurrentEpoch:          services.LatestEpoch(),
-		CurrentSlot:           services.LatestSlot(),
-		FinalizationDelay:     services.FinalizationDelay(),
-		EthPrice:              services.GetEthPrice(),
-		Mainnet:               utils.Config.Chain.Mainnet,
-		DepositContract:       utils.Config.Indexer.Eth1DepositContractAddress,
-	}
+
+	data := InitPageData(w, r, "advertisewithus", "/advertisewithus", "Adverstise With Us", templateFiles)
 
 	pageData := &types.AdvertiseWithUsPageData{}
+	pageData.RecaptchaKey = utils.Config.Frontend.RecaptchaSiteKey
+
 	pageData.FlashMessage, err = utils.GetFlash(w, r, "ad_flash")
 	if err != nil {
 		logger.Errorf("error retrieving flashes for advertisewithusform %v", err)
-		http.Error(w, "Internal server error", 503)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
-	data.Data = pageData
 
-	err = advertisewithusTemplate.ExecuteTemplate(w, "layout", data)
-	if err != nil {
-		logger.Errorf("error executing template for %v route: %v", r.URL.String(), err)
-		http.Error(w, "Internal server error", 503)
-		return
+	data.Data = pageData
+	if handleTemplateError(w, r, "advertisewithus.go", "AdvertiseWithUs", "", advertisewithusTemplate.ExecuteTemplate(w, "layout", data)) != nil {
+		return // an error has occurred and was processed
 	}
 }
 
 func AdvertiseWithUsPost(w http.ResponseWriter, r *http.Request) {
 	err := r.ParseForm()
 	if err != nil {
-		logger.Errorf("error parsing form: %v", err)
+		utils.LogError(err, "error parsing ad request form", 0, map[string]interface{}{
+			"route": r.URL.String(),
+		})
 		utils.SetFlash(w, r, "ad_flash", "Error: invalid form submitted")
 		http.Redirect(w, r, "/advertisewithus", http.StatusSeeOther)
+		return
+	}
+
+	if err := utils.HandleRecaptcha(w, r, "/advertisewithus"); err != nil {
 		return
 	}
 
@@ -83,7 +69,7 @@ func AdvertiseWithUsPost(w http.ResponseWriter, r *http.Request) {
 	// escape html
 	msg = template.HTMLEscapeString(msg)
 
-	err = mail.SendMail("support@beaconcha.in", "New ad inquiry", msg)
+	err = mail.SendTextMail(utils.Config.Frontend.Mail.Contact.InquiryEmail, "New ad inquiry", msg, []types.EmailAttachment{})
 	if err != nil {
 		logger.Errorf("error sending ad form: %v", err)
 		utils.SetFlash(w, r, "ad_flash", "Error: unable to submit ad request")
